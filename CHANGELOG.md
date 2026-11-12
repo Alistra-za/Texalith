@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (Unreleased)
+## 0.1.0
 
 - **Material** tab: from a normal map, makes Parallax, AO, Curvature, Cavity and Height data maps; from a height map, also a Normal.
 - **RNM** tab: blends any number of Bump, Detail and Bent layers into a base normal, each with its own strength, mask and green flip.
