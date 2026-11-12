@@ -97,11 +97,13 @@ pub fn read(png: &[u8]) -> Option<Marker> {
     decode(png)?.0
 }
 
-/// The PNG's header says no side exceeds the largest output, `from_normal::MAX_SIZE`. Reads the header only, so a
-/// huge file is never decoded.
+/// The longest side of any file Texalith writes: an RNM blend's.
+pub const MAX_SIDE: u32 = 8192;
+
+/// The PNG's header says no side exceeds the largest output, `MAX_SIDE`. Reads the header only, so a huge file is
+/// never decoded.
 pub fn fits(png: &[u8]) -> bool {
-    let max = crate::from_normal::MAX_SIZE;
-    png::Decoder::new(Cursor::new(png)).read_info().is_ok_and(|r| r.info().width <= max && r.info().height <= max)
+    png::Decoder::new(Cursor::new(png)).read_info().is_ok_and(|r| r.info().width <= MAX_SIDE && r.info().height <= MAX_SIDE)
 }
 
 /// A marker exists and its pixel hash matches the decoded pixels. A PNG larger than any output is never ours and is
@@ -191,9 +193,11 @@ pub(crate) mod tests {
 
     #[test]
     fn a_png_larger_than_any_output_is_never_ours() {
-        let big = encode_gray16(4097, 1, &vec![0.5; 4097], &sample(MapKind::HeightData));
+        let big = encode_gray16(8193, 1, &vec![0.5; 8193], &sample(MapKind::HeightData));
         assert!(!is_ours(&big));
         assert!(!fits(&big));
+        // An RNM output can be 8192 on a side, and Save must know its own file again.
+        assert!(is_ours(&encode_gray16(8192, 1, &vec![0.5; 8192], &sample(MapKind::HeightData))));
         assert!(fits(&encode_gray16(2, 2, &[0.5; 4], &sample(MapKind::HeightData))));
     }
 

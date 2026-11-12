@@ -7,6 +7,7 @@ use crate::export::{free_name, Planned};
 use crate::from_normal::files::{source, Source};
 use crate::marker::MapKind;
 use crate::save::{self, Review};
+use crate::settle::{self, Settle};
 use crate::tab::{error_line, folder_row, hint, line, slider_row_named, Row, EXTENSIONS};
 use eframe::egui;
 use engine::image::Rgba32F;
@@ -92,6 +93,7 @@ pub struct RnmTab {
     /// The layers and settings of the newest job, so any change in the column sends a job. The uid is part of it, so
     /// two layers with equal settings swapping places is a change.
     sent: Option<Vec<(u64, Layer)>>,
+    settle: Settle<Vec<(u64, Layer)>>,
     /// The id of the current base's first job; older outputs belong to another base.
     base_job: u64,
     next_uid: u64,
@@ -204,6 +206,7 @@ impl RnmTab {
             review: None,
             loads: vec![],
             sent: None,
+            settle: Settle::default(),
             base_job: 0,
             next_uid: 0,
             sibling_ao: None,
@@ -309,7 +312,7 @@ impl RnmTab {
     }
 
     /// Takes every output queued. Any output of the current base newer than the one shown is shown, so the view keeps
-    /// moving while a drag sends a job every frame; Save still waits for the newest job. True when new outputs arrived.
+    /// moving while newer jobs wait; Save still waits for the newest job. True when new outputs arrived.
     pub fn drain(&mut self) -> bool {
         let mut new = false;
         loop {
@@ -468,8 +471,15 @@ impl RnmTab {
                 None => {}
             }
         }
-        if self.base.is_some() && self.sent.as_ref() != Some(&self.key()) {
+        let key = self.key();
+        let pending = self.base.is_some() && self.sent.as_ref() != Some(&key);
+        if settle::due(ui, &mut self.settle, pending, &key) {
             self.submit();
+        } else if pending && self.jobs_sent >= self.base_job && self.outputs.as_ref().map(|o| o.id) != Some(self.jobs_sent) {
+            // A job for older settings is still out, and showing its result would stall the drag. With `sent` empty a
+            // job follows even when the slider comes back to the value that job had.
+            self.base_job = self.jobs_sent + 1;
+            self.sent = None;
         }
     }
 

@@ -14,8 +14,13 @@ const EMPTY: &str = "Open a base normal (_n or _cnr) to blend layers into it.";
 const ALPHA: &str = "Alpha is kept as it is.";
 
 fn rig<'a>() -> Harness<'a, RnmTab> {
+    rig_dt(0.25)
+}
+
+/// `rig` with `dt` seconds between frames; kittest's own step is a quarter second, longer than a slider's rest.
+fn rig_dt<'a>(dt: f32) -> Harness<'a, RnmTab> {
     let (jobs, outputs) = worker::spawn(|| {});
-    Harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+    Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_step_dt(dt).build_ui_state(
         |ui, tab: &mut RnmTab| {
             tab.drain();
             egui::Panel::left("column").resizable(false).exact_size(COLUMN_WIDTH).show(ui, |ui| tab.draw_column(ui));
@@ -281,6 +286,121 @@ fn a_layer_that_fails_to_load_is_reported_and_left_empty() {
     assert!(t.layers[0].file.is_some() && t.layers[1].file.is_none());
     assert_eq!(t.jobs_sent, sent);
     assert!(shown(&h, "None"));
+}
+
+#[test]
+fn a_moving_strength_slider_sends_no_job_until_it_rests() {
+    let d = temp("rest");
+    let b = base(&d, "rock_n.png");
+    layer(&d, "rock_bump.png");
+    let mut h = rig_dt(1.0 / 60.0);
+    open(&mut h, &b);
+    let sent = h.state().jobs_sent;
+    let c = h.get_by_role_and_label(Role::Slider, "Layer 1 strength").rect().center();
+    h.hover_at(c);
+    h.step();
+    h.drag_at(c);
+    h.step();
+    for k in 1..=10 {
+        h.hover_at(c + egui::vec2(3.0 * k as f32, 0.0));
+        h.step();
+    }
+    assert_eq!(h.state().jobs_sent, sent, "no job while the slider moves");
+    h.run_steps(20); // a third of a second at rest, the button still down
+    assert_eq!(h.state().jobs_sent, sent + 1, "one job once the slider rests");
+    h.drop_at(c + egui::vec2(30.0, 0.0));
+    h.run_steps(2);
+    assert_eq!(h.state().jobs_sent, sent + 1);
+}
+
+#[test]
+fn a_result_for_older_settings_does_not_land_while_a_slider_is_held() {
+    let d = temp("stale");
+    let b = base(&d, "rock_n.png");
+    layer(&d, "rock_bump.png");
+    // A stand-in for the blend thread, so a job can still be running when the slider moves.
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+        |ui, tab: &mut RnmTab| {
+            tab.drain();
+            egui::Panel::left("column").resizable(false).exact_size(COLUMN_WIDTH).show(ui, |ui| tab.draw_column(ui));
+        },
+        RnmTab::new(job_tx, out_rx),
+    );
+    let ctx = h.ctx.clone();
+    h.state_mut().open_base(b, &ctx);
+    for _ in 0..500 {
+        h.run_steps(1);
+        if !h.state().busy() && h.state().layers.iter().any(|l| l.file.is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.run_steps(2);
+    let running = h.state().jobs_sent;
+    assert!(running > 0 && job_rx.try_iter().count() > 0, "a job is out and has no result yet");
+    let out = |id| std::sync::Arc::new(worker::Output { id, size: (16, 16), px: vec![[0.5; 4]; 256], preview: None });
+    let c = h.get_by_role_and_label(Role::Slider, "Layer 1 strength").rect().center();
+    h.hover_at(c);
+    h.step();
+    h.drag_at(c);
+    h.step();
+    h.hover_at(c + egui::vec2(20.0, 0.0));
+    h.step();
+    out_tx.send(out(running)).unwrap();
+    h.run_steps(2);
+    assert!(h.state().outputs.is_none(), "showing it would stall the drag for settings already replaced");
+    h.drop_at(c + egui::vec2(20.0, 0.0));
+    h.run_steps(2);
+    let next = h.state().jobs_sent;
+    assert_eq!(next, running + 1, "a job for the value let go at");
+    out_tx.send(out(next)).unwrap();
+    h.run_steps(2);
+    assert_eq!(h.state().outputs.as_ref().map(|o| o.id), Some(next));
+}
+
+#[test]
+#[ignore = "one real 8192 blend: several GB of memory and minutes; run alone with --ignored --nocapture"]
+fn an_8192_base_blends_and_saves() {
+    let d = temp("8192");
+    let p = d.join("big_n.png");
+    image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_fn(8192, 8192, |x, y| {
+        image::Rgba([32768 + (x % 64) as u16 * 100, 32768 - (y % 64) as u16 * 100, 65535, 65535])
+    })
+    .save(&p)
+    .unwrap();
+    layer(&d, "big_detail.png");
+    let mut h = rig();
+    let start = std::time::Instant::now();
+    let ctx = h.ctx.clone();
+    h.state_mut().open_base(p, &ctx);
+    // `settle` gives up after five seconds, which an 8192 load and blend outlast.
+    loop {
+        h.run_steps(1);
+        let t = h.state();
+        if let Some(Err(e)) = &t.status {
+            panic!("{e}");
+        }
+        if !t.busy() && t.jobs_sent > 0 && t.outputs.as_ref().map(|o| o.id) == Some(t.jobs_sent) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(900), "no blend after 15 minutes");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let blended = start.elapsed();
+    let o = h.state().outputs.clone().unwrap();
+    assert_eq!(o.size, (8192, 8192));
+    assert_eq!(h.state().layers.len(), 1, "the detail layer beside the base");
+    let n = &o.preview.as_ref().expect("packed maps")["n"];
+    assert_eq!(u32::from_le_bytes(n[16..20].try_into().unwrap()), 4096, "the preview's map is halved");
+    let out = temp("8192-out");
+    h.state_mut().folder = Some(out.clone());
+    h.run_steps(2);
+    press(&mut h, "Save");
+    let saved = std::fs::read(out.join("big_n.png")).expect("the saved blend");
+    assert!(marker::is_ours(&saved));
+    eprintln!("8192: open and blend {blended:.1?}, with save {:.1?}, file {} MB", start.elapsed(), saved.len() >> 20);
 }
 
 #[test]
@@ -579,7 +699,7 @@ fn an_older_output_of_the_same_base_is_shown_while_newer_jobs_run() {
     let src = texalith::from_normal::files::source(&b).unwrap();
     t.base = Some((src, img));
     t.jobs_sent = 3;
-    let out = |id| Arc::new(worker::Output { id, size: (16, 16), px: vec![[0.5; 4]; 256] });
+    let out = |id| Arc::new(worker::Output { id, size: (16, 16), px: vec![[0.5; 4]; 256], preview: None });
     out_tx.send(out(2)).unwrap();
     assert!(t.drain(), "a newer output than the one shown is shown, even while job 3 runs");
     assert_eq!(t.outputs.as_ref().map(|o| o.id), Some(2));

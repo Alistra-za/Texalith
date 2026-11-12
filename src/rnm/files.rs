@@ -1,8 +1,7 @@
 //! RNM output names, the layer files found beside a base, and the bases RNM refuses.
 use super::{Kind, Layer};
 use crate::from_normal::files::{base_name, Source};
-use crate::from_normal::MAX_SIZE;
-use crate::marker::{encode_rgba16, MapKind, Marker};
+use crate::marker::{encode_rgba16, MapKind, Marker, MAX_SIDE};
 use crate::tab::EXTENSIONS;
 use engine::image::Rgba32F;
 use serde_json::{json, Value};
@@ -201,14 +200,15 @@ pub fn siblings(base: &Path) -> Found {
     Found { layers, ao: take[10].take() }
 }
 
-/// Why RNM will not open `path` as a base, if it will not: a model-space `_msn` name, or a side above `MAX_SIZE`.
+/// Why RNM will not open `path` as a base, if it will not: a model-space `_msn` name, or a side above `MAX_SIDE`. A blend is one pass
+/// over the texels, so it goes to 8192 where the Material tab's solve stops at 4096.
 pub fn refuse(path: &Path, size: (u32, u32)) -> Option<String> {
     let name = file_name(path);
     let lower = file_stem(path).to_ascii_lowercase();
     if lower.ends_with("_msn") {
         Some(format!("{name} is a model-space normal (_msn); RNM blends tangent-space normals only."))
-    } else if size.0 > MAX_SIZE || size.1 > MAX_SIZE {
-        Some(format!("{name} is {}x{}; the largest Texalith output is {MAX_SIZE}, so resize it first.", size.0, size.1))
+    } else if size.0 > MAX_SIDE || size.1 > MAX_SIDE {
+        Some(format!("{name} is {}x{}; the largest RNM output is {MAX_SIDE}, so resize it first.", size.0, size.1))
     } else {
         None
     }
@@ -323,9 +323,9 @@ mod tests {
             Some("rock_msn.png is a model-space normal (_msn); RNM blends tangent-space normals only.")
         );
         assert_eq!(
-            refuse(Path::new("C:/t/rock_n.png"), (4097, 16)).as_deref(),
-            Some("rock_n.png is 4097x16; the largest Texalith output is 4096, so resize it first.")
+            refuse(Path::new("C:/t/rock_n.png"), (8193, 16)).as_deref(),
+            Some("rock_n.png is 8193x16; the largest RNM output is 8192, so resize it first.")
         );
-        assert_eq!(refuse(Path::new("C:/t/rock_n.png"), (4096, 4096)), None);
+        assert_eq!(refuse(Path::new("C:/t/rock_n.png"), (8192, 8192)), None);
     }
 }

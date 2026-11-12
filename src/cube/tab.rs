@@ -11,6 +11,7 @@ use crate::from_normal::files::Source;
 use crate::marker::MapKind;
 use crate::rnm::tab::guarded;
 use crate::save::{self, Review};
+use crate::settle::{self, Settle};
 use crate::tab::{error_line, folder_row, hint, line, slider_row, Row, EXTENSIONS};
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -60,6 +61,7 @@ pub struct CubeTab {
     load: Option<Receiver<Result<Opened, String>>>,
     /// The settings last acted on (sent, or refused as not fitting), so any change in the column is acted on once.
     sent: Option<Settings>,
+    settle: Settle<Settings>,
     /// The id of the current source's first job; older outputs belong to another source.
     first_job: u64,
     /// The face Fix one side edits.
@@ -92,6 +94,7 @@ impl CubeTab {
             review: None,
             load: None,
             sent: None,
+            settle: Settle::default(),
             first_job: 0,
             fix_face: 0,
         }
@@ -178,9 +181,16 @@ impl CubeTab {
     }
 
     /// Acts once on settings that changed: sends a job when the type fits, else says why not.
-    fn act(&mut self) {
+    fn act(&mut self, ui: &egui::Ui) {
         let Some(opened) = self.opened.clone() else { return };
-        if self.sent.as_ref() == Some(&self.settings) {
+        let pending = self.sent.as_ref() != Some(&self.settings);
+        if !settle::due(ui, &mut self.settle, pending, &self.settings) {
+            if pending && self.jobs_sent >= self.first_job && self.outputs.as_ref().map(|o| o.id) != Some(self.jobs_sent) {
+                // A job for older settings is still out, and showing its result would stall the drag. With `sent`
+                // empty a job follows even when the slider comes back to the value that job had.
+                self.first_job = self.jobs_sent + 1;
+                self.sent = None;
+            }
             return;
         }
         self.sent = Some(self.settings.clone());
@@ -227,7 +237,7 @@ impl CubeTab {
                 None => {}
             }
         }
-        self.act();
+        self.act(ui);
     }
 
     fn source_rows(&mut self, ui: &mut egui::Ui) {

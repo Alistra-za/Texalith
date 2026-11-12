@@ -4,6 +4,12 @@ use crate::from_normal::maps::Gray;
 use crate::from_normal::worker::Outputs;
 use std::collections::HashMap;
 
+/// DDS files by render3d slot name.
+pub type Maps = HashMap<&'static str, Vec<u8>>;
+
+/// The longest side of a map the 3D preview binds; a larger output is box-filtered down to it.
+pub const PREVIEW_MAX: u32 = 4096;
+
 /// A DX10 RGBA8 DDS of `w`×`h` texels with a full box-filtered mip chain; each side halves down to 1, and a texel
 /// averages the source texels its 2×2 block holds.
 pub fn dds_rgba8(w: u32, h: u32, base: &[[u8; 4]], srgb: bool) -> Vec<u8> {
@@ -31,25 +37,29 @@ pub fn dds_rgba8(w: u32, h: u32, base: &[[u8; 4]], srgb: bool) -> Vec<u8> {
         if lw == 1 && lh == 1 {
             break;
         }
-        let (nw, nh) = ((lw / 2).max(1), (lh / 2).max(1));
-        let mut next = Vec::with_capacity(nw * nh);
-        for y in 0..nh {
-            let ys = [2 * y, (2 * y + 1).min(lh - 1)];
-            let ys = if ys[0] == ys[1] { &ys[..1] } else { &ys[..] };
-            for x in 0..nw {
-                let xs = [2 * x, (2 * x + 1).min(lw - 1)];
-                let xs = if xs[0] == xs[1] { &xs[..1] } else { &xs[..] };
-                let n = (xs.len() * ys.len()) as u32;
-                next.push(std::array::from_fn(|k| {
-                    let sum: u32 = ys.iter().flat_map(|&j| xs.iter().map(move |&i| (i, j))).map(|(i, j)| u32::from(level[j * lw + i][k])).sum();
-                    ((sum + n / 2) / n) as u8
-                }));
-            }
-        }
-        level = next;
-        (lw, lh) = (nw, nh);
+        (level, lw, lh) = halve(&level, lw, lh);
     }
     b
+}
+
+/// `level` (`lw`×`lh`) at half each side, never below 1: a texel averages the texels its 2×2 block holds.
+fn halve(level: &[[u8; 4]], lw: usize, lh: usize) -> (Vec<[u8; 4]>, usize, usize) {
+    let (nw, nh) = ((lw / 2).max(1), (lh / 2).max(1));
+    let mut next = Vec::with_capacity(nw * nh);
+    for y in 0..nh {
+        let ys = [2 * y, (2 * y + 1).min(lh - 1)];
+        let ys = if ys[0] == ys[1] { &ys[..1] } else { &ys[..] };
+        for x in 0..nw {
+            let xs = [2 * x, (2 * x + 1).min(lw - 1)];
+            let xs = if xs[0] == xs[1] { &xs[..1] } else { &xs[..] };
+            let n = (xs.len() * ys.len()) as u32;
+            next.push(std::array::from_fn(|k| {
+                let sum: u32 = ys.iter().flat_map(|&j| xs.iter().map(move |&i| (i, j))).map(|(i, j)| u32::from(level[j * lw + i][k])).sum();
+                ((sum + n / 2) / n) as u8
+            }));
+        }
+    }
+    (next, nw, nh)
 }
 
 fn byte(v: f32) -> u8 {
@@ -77,10 +87,20 @@ pub fn maps_for(o: &Outputs) -> HashMap<&'static str, Vec<u8>> {
     maps
 }
 
-/// The RNM tab's preview maps: the `n` slot only, with the blend's alpha.
-pub fn normal_only(size: (u32, u32), px: &[[f32; 4]]) -> HashMap<&'static str, Vec<u8>> {
-    let n: Vec<[u8; 4]> = px.iter().map(|p| p.map(byte)).collect();
-    HashMap::from([("n", dds_rgba8(size.0, size.1, &n, false))])
+/// The RNM tab's preview maps: the `n` slot only, with the blend's alpha. An output over `PREVIEW_MAX` is halved
+/// until it fits: an 8192 map would be 360 MB of preview texture.
+pub fn normal_only(size: (u32, u32), px: &[[f32; 4]]) -> Maps {
+    let mut n: Vec<[u8; 4]> = px.iter().map(|p| p.map(byte)).collect();
+    let (mut w, mut h) = (size.0 as usize, size.1 as usize);
+    while w.max(h) > PREVIEW_MAX as usize {
+        (n, w, h) = halve(&n, w, h);
+    }
+    HashMap::from([("n", dds_rgba8(w as u32, h as u32, &n, false))])
+}
+
+/// The Cubemap tab's preview map: the `e` slot only.
+pub fn cube_only(c: &engine::cube::Cube) -> Maps {
+    HashMap::from([("e", crate::cube::files::preview_dds(c))])
 }
 
 #[cfg(test)]
@@ -154,7 +174,15 @@ mod tests {
             cavity: None,
             curvature: None,
             compare: None,
+            preview: None,
         }
+    }
+
+    #[test]
+    fn a_normal_over_the_preview_limit_is_halved_for_the_preview() {
+        let maps = normal_only((8192, 2), &vec![[0.5, 0.5, 1.0, 1.0]; 8192 * 2]);
+        assert_eq!((u(&maps["n"], 16), u(&maps["n"], 12)), (4096, 1)); // width, height
+        assert_eq!(&maps["n"][148..152], &[128, 128, 255, 255]);
     }
 
     #[test]

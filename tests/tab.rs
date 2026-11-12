@@ -20,9 +20,14 @@ struct Rig {
 }
 
 fn rig<'a>(width: f32) -> (Harness<'a, Tab>, Rig) {
+    rig_dt(width, 0.25)
+}
+
+/// `rig` with `dt` seconds between frames; kittest's own step is a quarter second, longer than a slider's rest.
+fn rig_dt<'a>(width: f32, dt: f32) -> (Harness<'a, Tab>, Rig) {
     let (job_tx, job_rx) = channel();
     let (reply_tx, reply_rx) = channel();
-    let h = Harness::builder().with_size(egui::vec2(width, 900.0)).build_ui_state(
+    let h = Harness::builder().with_size(egui::vec2(width, 900.0)).with_step_dt(dt).build_ui_state(
         |ui, tab: &mut Tab| {
             tab.drain();
             egui::Panel::left("column")
@@ -73,6 +78,7 @@ fn outputs(id: u64) -> Outputs {
         cavity: Some(gray()),
         curvature: Some(gray()),
         compare: None,
+        preview: None,
     }
 }
 
@@ -133,6 +139,92 @@ fn dragging_flatten_sends_drafts_and_release_sends_a_full_job() {
     let last = jobs(&rig).pop().expect("a job on release");
     assert!(!last.draft);
     assert_eq!(last.settings.master.flatten, h.state().settings.as_ref().unwrap().master.flatten);
+}
+
+/// Presses the slider named `label` at its centre and moves it right for ten frames at 60 a second. Returns where
+/// the pointer ends, still held.
+fn hold_and_move(h: &mut Harness<'_, Tab>, label: &str) -> egui::Pos2 {
+    let c = h.get_by_role_and_label(Role::Slider, label).rect().center();
+    h.hover_at(c);
+    h.step();
+    h.drag_at(c);
+    h.step();
+    for k in 1..=10 {
+        h.hover_at(c + egui::vec2(3.0 * k as f32, 0.0));
+        h.step();
+    }
+    c + egui::vec2(30.0, 0.0)
+}
+
+#[test]
+fn a_moving_slider_sends_no_job_until_it_rests() {
+    let (mut h, rig) = rig_dt(1280.0, 1.0 / 60.0);
+    h.state_mut().accept(normal_source("rest"));
+    h.run_steps(2);
+    rig.replies.send(Reply::Done(Box::new(outputs(1)))).unwrap();
+    h.run_steps(2);
+    jobs(&rig);
+    let end = hold_and_move(&mut h, "Depth");
+    assert!(jobs(&rig).is_empty(), "no job while the slider moves");
+    h.run_steps(20); // a third of a second at rest, the button still down
+    let sent = jobs(&rig);
+    assert_eq!(sent.len(), 1, "one job once the slider rests");
+    assert_eq!(sent[0].settings, *h.state().settings.as_ref().unwrap());
+    h.drop_at(end);
+    h.run_steps(2);
+    assert!(jobs(&rig).is_empty(), "the resting value was sent already");
+}
+
+#[test]
+fn a_longer_update_delay_holds_the_job_back() {
+    let (mut h, rig) = rig_dt(1280.0, 1.0 / 60.0);
+    texalith::settle::set_rest(&h.ctx, 1.0);
+    h.state_mut().accept(normal_source("long-rest"));
+    h.run_steps(2);
+    rig.replies.send(Reply::Done(Box::new(outputs(1)))).unwrap();
+    h.run_steps(2);
+    jobs(&rig);
+    hold_and_move(&mut h, "Depth");
+    h.run_steps(20); // a third of a second at rest: enough for the default delay, not for one second
+    assert!(jobs(&rig).is_empty(), "the delay in use is the one set");
+    h.run_steps(50);
+    assert_eq!(jobs(&rig).len(), 1);
+}
+
+#[test]
+fn letting_go_of_a_slider_sends_its_job_at_once() {
+    let (mut h, rig) = rig_dt(1280.0, 1.0 / 60.0);
+    h.state_mut().accept(normal_source("let-go"));
+    h.run_steps(2);
+    rig.replies.send(Reply::Done(Box::new(outputs(1)))).unwrap();
+    h.run_steps(2);
+    jobs(&rig);
+    let end = hold_and_move(&mut h, "Depth");
+    h.drop_at(end);
+    h.run_steps(2);
+    let sent = jobs(&rig);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].settings, *h.state().settings.as_ref().unwrap());
+}
+
+#[test]
+fn moving_a_slider_stops_the_running_job_and_a_new_one_follows() {
+    let (mut h, rig) = rig_dt(1280.0, 1.0 / 60.0);
+    h.state_mut().accept(normal_source("stop"));
+    h.run_steps(2);
+    let first = jobs(&rig).pop().expect("the job for the opened file"); // still running: no reply
+    let end = hold_and_move(&mut h, "Depth");
+    assert!(first.cancel.load(std::sync::atomic::Ordering::Relaxed), "its result would land in the middle of the drag");
+    assert!(jobs(&rig).is_empty());
+    // The thread can be past its last cancel check (packing the preview's maps) and still answer.
+    rig.replies.send(Reply::Done(Box::new(outputs(first.id)))).unwrap();
+    h.run_steps(2);
+    assert!(h.state().outputs.is_none(), "a stopped job's result is not shown");
+    h.drop_at(end);
+    h.run_steps(2);
+    let last = jobs(&rig).pop().expect("a job on release");
+    assert!(!last.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(last.settings, *h.state().settings.as_ref().unwrap());
 }
 
 #[test]

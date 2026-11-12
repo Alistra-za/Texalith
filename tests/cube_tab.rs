@@ -13,8 +13,13 @@ use texalith::tab::COLUMN_WIDTH;
 const EMPTY: &str = "Open a panorama, cross, strip, mirror ball, angular map, photo or one of six face files to make a cube.";
 
 fn rig<'a>() -> Harness<'a, CubeTab> {
+    rig_dt(0.25)
+}
+
+/// `rig` with `dt` seconds between frames; kittest's own step is a quarter second, longer than a slider's rest.
+fn rig_dt<'a>(dt: f32) -> Harness<'a, CubeTab> {
     let (jobs, outputs) = worker::spawn(|| {});
-    Harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+    Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_step_dt(dt).build_ui_state(
         |ui, tab: &mut CubeTab| {
             tab.drain();
             egui::Panel::left("column").resizable(false).exact_size(COLUMN_WIDTH).show(ui, |ui| tab.draw_column(ui));
@@ -98,6 +103,79 @@ fn a_panorama_is_detected_and_makes_a_cube() {
     h.get_by_role_and_label(Role::Slider, "Brightness");
     let o = h.state().outputs.clone().expect("an output");
     assert_eq!((o.n, o.cube.size), (16, 16));
+}
+
+#[test]
+fn a_moving_brightness_slider_sends_no_job_until_it_rests() {
+    let d = temp("rest");
+    let p = png(&d, "pano.png", 64, 32);
+    let mut h = rig_dt(1.0 / 60.0);
+    open(&mut h, &p);
+    let sent = h.state().jobs_sent;
+    let c = h.get_by_role_and_label(Role::Slider, "Brightness").rect().center();
+    h.hover_at(c);
+    h.step();
+    h.drag_at(c);
+    h.step();
+    for k in 1..=10 {
+        h.hover_at(c + egui::vec2(3.0 * k as f32, 0.0));
+        h.step();
+    }
+    assert_eq!(h.state().jobs_sent, sent, "no job while the slider moves");
+    h.run_steps(20); // a third of a second at rest, the button still down
+    assert_eq!(h.state().jobs_sent, sent + 1, "one job once the slider rests");
+    h.drop_at(c + egui::vec2(30.0, 0.0));
+    h.run_steps(2);
+    assert_eq!(h.state().jobs_sent, sent + 1);
+}
+
+#[test]
+fn a_result_for_older_settings_does_not_land_while_a_slider_is_held() {
+    let d = temp("stale");
+    let p = png(&d, "pano.png", 64, 32);
+    // A stand-in for the cube thread, so a job can still be running when the slider moves.
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+        |ui, tab: &mut CubeTab| {
+            tab.drain();
+            egui::Panel::left("column").resizable(false).exact_size(COLUMN_WIDTH).show(ui, |ui| tab.draw_column(ui));
+        },
+        CubeTab::new(job_tx, out_rx),
+    );
+    let ctx = h.ctx.clone();
+    h.state_mut().open(p, &ctx);
+    for _ in 0..500 {
+        h.run_steps(1);
+        if !h.state().busy() && h.state().jobs_sent > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.run_steps(2);
+    let running = h.state().jobs_sent;
+    assert!(running > 0 && job_rx.try_iter().count() > 0, "a job is out and has no result yet");
+    let out = |id| {
+        let faces = std::array::from_fn(|_| engine::image::Rgba32F::new(4, 4, [0.5; 4]));
+        std::sync::Arc::new(worker::Output { id, n: 4, cube: engine::cube::Cube { size: 4, faces }, preview: None })
+    };
+    let c = h.get_by_role_and_label(Role::Slider, "Brightness").rect().center();
+    h.hover_at(c);
+    h.step();
+    h.drag_at(c);
+    h.step();
+    h.hover_at(c + egui::vec2(20.0, 0.0));
+    h.step();
+    out_tx.send(out(running)).unwrap();
+    h.run_steps(2);
+    assert!(h.state().outputs.is_none(), "showing it would stall the drag for settings already replaced");
+    h.drop_at(c + egui::vec2(20.0, 0.0));
+    h.run_steps(2);
+    let next = h.state().jobs_sent;
+    assert_eq!(next, running + 1, "a job for the value let go at");
+    out_tx.send(out(next)).unwrap();
+    h.run_steps(2);
+    assert_eq!(h.state().outputs.as_ref().map(|o| o.id), Some(next));
 }
 
 #[test]

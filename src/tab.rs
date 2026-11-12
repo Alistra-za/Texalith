@@ -7,6 +7,7 @@ use crate::from_normal::settings::{fade_pct, Settings, PRESETS};
 use crate::from_normal::worker::{Job, Outputs, Reply};
 use crate::marker::MapKind;
 use crate::save::{self, Review};
+use crate::settle::{self, Settle};
 use crate::view2d;
 use eframe::egui;
 use egui::collapsing_header::{paint_default_icon, CollapsingState};
@@ -70,6 +71,7 @@ pub struct Tab {
     running: bool,
     /// The settings of the newest job, so any change in the column sends a job.
     sent: Option<Settings>,
+    settle: Settle<Option<Settings>>,
     last_draft: bool,
     /// A slider whose drags send drafts is held this frame.
     dragging: bool,
@@ -279,6 +281,7 @@ impl Tab {
             progress: None,
             running: false,
             sent: None,
+            settle: Settle::default(),
             last_draft: false,
             dragging: false,
             opening: None,
@@ -421,8 +424,18 @@ impl Tab {
             ui.add_space(8.0);
         });
         self.review_dialog(ui.ctx());
-        if self.settings != self.sent {
+        let pending = self.settings != self.sent;
+        if settle::due(ui, &mut self.settle, pending, &self.settings) {
             self.submit(self.dragging);
+        } else if pending {
+            if let Some(c) = self.cancel.take() {
+                // The running job is for older settings, and its result would land in the middle of the drag. With
+                // `sent` empty a job follows even when the slider comes back to the value that job had.
+                c.store(true, Ordering::Relaxed);
+                self.sent = None;
+                // The thread may be past its last cancel check and still answer: no reply has this id.
+                self.jobs_sent += 1;
+            }
         } else if self.last_draft && !self.dragging {
             self.submit(false);
         }

@@ -81,7 +81,7 @@ fn rig<'a>(size: (f32, f32)) -> (Harness<'a, App>, Rig) {
 fn deliver_cube(h: &mut Harness<'_, App>, rig: &Rig, id: u64) {
     h.state_mut().cube.jobs_sent = id;
     let faces = std::array::from_fn(|k| engine::image::Rgba32F::new(4, 4, [0.1 * k as f32, 0.5, 0.3, 1.0]));
-    let o = cube_worker::Output { id, n: 4, cube: engine::cube::Cube { size: 4, faces } };
+    let o = cube_worker::Output { id, n: 4, cube: engine::cube::Cube { size: 4, faces }, preview: None };
     rig.cube_outputs.send(Arc::new(o)).unwrap();
     h.run_steps(2);
 }
@@ -103,7 +103,7 @@ fn cube_filled(h: &mut Harness<'_, App>) {
 /// Sends a 4x4 RNM output whose red is `v` as the reply to the RNM tab's newest job.
 fn deliver_rnm(h: &mut Harness<'_, App>, rig: &Rig, id: u64, v: f32) {
     h.state_mut().rnm.jobs_sent = id;
-    let o = rnm_worker::Output { id, size: (4, 4), px: vec![[v, 0.5, 1.0, 1.0]; 16] };
+    let o = rnm_worker::Output { id, size: (4, 4), px: vec![[v, 0.5, 1.0, 1.0]; 16], preview: None };
     rig.rnm_outputs.send(Arc::new(o)).unwrap();
     h.run_steps(2);
 }
@@ -167,7 +167,50 @@ fn outputs(id: u64, ao: f32) -> Outputs {
         cavity: None,
         curvature: None,
         compare: None,
+        preview: None,
     }
+}
+
+#[test]
+fn the_preview_panel_sets_the_update_delay() {
+    let (mut h, _rig) = rig((1280.0, 800.0));
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::Slider, "Update delay");
+    h.get_by_role_and_label(Role::Button, "Reset Update delay to 0.2 s");
+    assert_eq!(texalith::settle::rest(&h.ctx), texalith::settle::REST);
+    h.get_by_role_and_label(Role::Slider, "Update delay").focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::ArrowRight);
+    h.run_steps(2);
+    assert!(texalith::settle::rest(&h.ctx) > texalith::settle::REST, "the slider's value is the delay in use");
+    // In the 2D view too: the delay is not a 3D setting.
+    h.get_by_role_and_label(Role::Button, "2D").click();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::Slider, "Update delay");
+}
+
+#[test]
+fn maps_packed_by_the_thread_reach_the_preview_as_they_are() {
+    let (mut h, rig) = rig((1280.0, 800.0));
+    h.run_steps(2);
+    tab_button(&mut h, "RNM");
+    let _ = pushes(&rig.cmds);
+    // Not what the output's own texels would pack to, so only the carried map can give these bytes.
+    let packed = texalith::preview_maps::normal_only((4, 4), &[[0.25, 0.75, 1.0, 1.0]; 16]);
+    h.state_mut().rnm.jobs_sent = 1;
+    let o = rnm_worker::Output { id: 1, size: (4, 4), px: vec![[0.5, 0.5, 1.0, 1.0]; 16], preview: Some(Arc::new(packed.clone())) };
+    rig.rnm_outputs.send(Arc::new(o)).unwrap();
+    h.run_steps(2);
+    let sent: Vec<Vec<u8>> = rig
+        .cmds
+        .try_iter()
+        .filter_map(|c| match c {
+            Cmd::SetContent(c) => c.maps.get("n").cloned(),
+            Cmd::SwapMap("n", b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, vec![packed["n"].clone()]);
 }
 
 /// Sends `o` as the reply to the newest job.
@@ -482,7 +525,7 @@ fn the_cubemap_tab_draws_its_cube_on_a_ball_in_3d() {
     // A changed cube is swapped in.
     let faces = std::array::from_fn(|_| engine::image::Rgba32F::new(4, 4, [0.9, 0.1, 0.1, 1.0]));
     h.state_mut().cube.jobs_sent = 2;
-    rig.cube_outputs.send(Arc::new(cube_worker::Output { id: 2, n: 4, cube: engine::cube::Cube { size: 4, faces } })).unwrap();
+    rig.cube_outputs.send(Arc::new(cube_worker::Output { id: 2, n: 4, cube: engine::cube::Cube { size: 4, faces }, preview: None })).unwrap();
     h.run_steps(2);
     assert_eq!(pushes(&rig.cmds).1, ["e"]);
     // The Material tab keeps its own choice of view.

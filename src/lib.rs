@@ -11,6 +11,7 @@ pub mod resample;
 pub mod restart;
 pub mod rnm;
 pub mod save;
+pub mod settle;
 pub mod tab;
 pub mod testmaps;
 pub mod view2d;

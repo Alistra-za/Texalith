@@ -51,6 +51,8 @@ pub struct Outputs {
     pub curvature: Option<Gray>,
     /// Height data at Flatten 0, the job's value and 1, at most `COMPARE_SIZE` on the longer side.
     pub compare: Option<[Gray; 3]>,
+    /// The 3D preview's maps, packed on the generation thread; `None` from `compute` alone.
+    pub preview: Option<Arc<crate::preview_maps::Maps>>,
 }
 
 pub enum Reply {
@@ -179,6 +181,7 @@ pub fn compute(cache: &mut Cache, job: &Job) -> Result<Option<Outputs>, String> 
         cavity: cavity.flatten(),
         curvature: curvature.flatten(),
         compare: compare.flatten(),
+        preview: None,
     }))
 }
 
@@ -217,7 +220,14 @@ pub fn spawn(repaint: impl Fn() + Send + 'static) -> (Sender<Job>, Receiver<Repl
             while let Ok(first) = job_rx.recv() {
                 let job = job_rx.try_iter().last().unwrap_or(first);
                 let reply = match compute(&mut cache, &job) {
-                    Ok(Some(o)) => Reply::Done(Box::new(o)),
+                    Ok(Some(mut o)) => {
+                        // Packed here, so the UI thread does none of it when the reply lands.
+                        o.preview = Some(Arc::new(crate::preview_maps::maps_for(&o)));
+                        if job.cancel.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        Reply::Done(Box::new(o))
+                    }
                     Ok(None) => continue,
                     Err(message) => Reply::Failed { id: job.id, message },
                 };
@@ -378,7 +388,10 @@ mod tests {
         }
         loop {
             match rx.recv_timeout(Duration::from_secs(30)).expect("a reply") {
-                Reply::Done(o) if o.id == 5 => break,
+                Reply::Done(o) if o.id == 5 => {
+                    assert!(o.preview.as_ref().is_some_and(|m| m.contains_key("n")), "the thread packs the preview's maps");
+                    break;
+                }
                 Reply::Done(_) => {}
                 Reply::Failed { message, .. } => panic!("{message}"),
             }

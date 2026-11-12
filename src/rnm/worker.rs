@@ -1,6 +1,7 @@
 //! The RNM blend thread: the newest job wins.
 use super::blend::{apply, encode};
 use super::Input;
+use crate::preview_maps::{self, Maps};
 use engine::image::Rgba32F;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -18,13 +19,22 @@ pub struct Output {
     pub size: (u32, u32),
     /// Stored texels 0..1 with the base's alpha.
     pub px: Vec<[f32; 4]>,
+    /// The 3D preview's maps, packed on the blend thread; `None` from `compute` alone.
+    pub preview: Option<Arc<Maps>>,
 }
 
 // shortcut: every job resamples each layer again; cache resampled layers by slot and size if drags stutter at 4096.
 pub fn compute(job: &Job) -> Output {
     let mut work = (*job.base).clone();
     apply(&mut work, &job.layers);
-    Output { id: job.id, size: (work.width, work.height), px: encode(&work) }
+    Output { id: job.id, size: (work.width, work.height), px: encode(&work), preview: None }
+}
+
+/// `compute` with the preview's maps packed: what the blend thread sends, so the UI thread packs nothing.
+pub fn finish(job: &Job) -> Output {
+    let mut o = compute(job);
+    o.preview = Some(Arc::new(preview_maps::normal_only(o.size, &o.px)));
+    o
 }
 
 /// The blend thread. Before each job it drops every older queued job; `repaint` runs after each output.
@@ -36,7 +46,7 @@ pub fn spawn(repaint: impl Fn() + Send + 'static) -> (Sender<Job>, Receiver<Arc<
         .spawn(move || {
             while let Ok(first) = job_rx.recv() {
                 let job = job_rx.try_iter().last().unwrap_or(first);
-                if out_tx.send(Arc::new(compute(&job))).is_err() {
+                if out_tx.send(Arc::new(finish(&job))).is_err() {
                     break;
                 }
                 repaint();
@@ -79,6 +89,15 @@ mod tests {
         assert_eq!((o.id, o.size), (7, (8, 4)));
         assert!(o.px.iter().zip(&j.base.px).all(|(a, b)| a[3] == b[3]));
         assert!(o.px.iter().zip(encode(&j.base)).any(|(a, b)| a[..3] != b[..3]), "the detail must change something");
+    }
+
+    #[test]
+    fn the_thread_packs_the_preview_normal() {
+        let o = finish(&job(1, vec![]));
+        let n = &o.preview.as_ref().expect("packed maps")["n"];
+        let u = |at: usize| u32::from_le_bytes(n[at..at + 4].try_into().unwrap());
+        assert_eq!((u(16), u(12)), (8, 4)); // the DDS header's width and height
+        assert_eq!(**o.preview.as_ref().unwrap(), preview_maps::normal_only(o.size, &o.px));
     }
 
     #[test]

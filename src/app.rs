@@ -3,9 +3,11 @@ use crate::cube::tab::CubeTab;
 use crate::from_normal::maps::FlatLevel;
 use crate::marker::MapKind;
 use crate::preview::{Cmd, Content, Frame, Reply, View};
-use crate::preview_maps;
+use crate::preview_maps::{self, Maps};
 use crate::rnm::tab::RnmTab;
-use crate::tab::{Tab, COLUMN_WIDTH};
+use crate::settle;
+use crate::tab::{slider_row, Row, Tab, COLUMN_WIDTH};
+use std::sync::Arc;
 use crate::view2d::{self, View2d};
 use eframe::egui;
 use render3d::scene::{AUTO_PITCH, AUTO_YAW};
@@ -90,7 +92,7 @@ pub struct App {
     /// The 2D view's textures, dropped when new outputs arrive.
     textures: HashMap<MapKind, egui::TextureHandle>,
     /// The DDS bytes last sent to the preview, by slot.
-    slots: Option<HashMap<&'static str, Vec<u8>>>,
+    slots: Option<Arc<Maps>>,
     /// What the preview was last told about the `p` map's flat level.
     white: bool,
 }
@@ -154,12 +156,13 @@ impl App {
     }
 
     /// The active tab's maps for the preview, when it has outputs.
-    fn active_maps(&self) -> Option<HashMap<&'static str, Vec<u8>>> {
-        // shortcut: the DDS encode runs on the UI thread; move it to the generation thread if 2048 updates stutter.
+    fn active_maps(&self) -> Option<Arc<Maps>> {
+        // The threads pack them (`finish` in each worker); only an output made without its thread is packed here.
+        let or_pack = |packed: &Option<Arc<Maps>>, pack: &dyn Fn() -> Maps| packed.clone().unwrap_or_else(|| Arc::new(pack()));
         match self.mode {
-            Mode::FromNormal => self.tab.outputs.as_ref().map(|o| preview_maps::maps_for(o)),
-            Mode::Rnm => self.rnm.outputs.as_ref().map(|o| preview_maps::normal_only(o.size, &o.px)),
-            Mode::Cube => self.cube.outputs.as_ref().map(|o| HashMap::from([("e", crate::cube::files::preview_dds(&o.cube))])),
+            Mode::FromNormal => self.tab.outputs.as_ref().map(|o| or_pack(&o.preview, &|| preview_maps::maps_for(o))),
+            Mode::Rnm => self.rnm.outputs.as_ref().map(|o| or_pack(&o.preview, &|| preview_maps::normal_only(o.size, &o.px))),
+            Mode::Cube => self.cube.outputs.as_ref().map(|o| or_pack(&o.preview, &|| preview_maps::cube_only(&o.cube))),
         }
     }
 
@@ -177,18 +180,20 @@ impl App {
     fn push_maps(&mut self) {
         let maps = self.active_maps().unwrap_or_default();
         let white = self.white();
+        // shortcut: each changed map is copied once here for the render thread (about 90 MB at 4096); carry an Arc
+        // in Cmd if that copy shows as a stall.
         match &self.slots {
             Some(old) if old.len() == maps.len() && maps.keys().all(|k| old.contains_key(k)) => {
                 if white != self.white {
                     self.send(Cmd::SetWhite(white));
                 }
-                for (k, b) in &maps {
+                for (k, b) in maps.iter() {
                     if old[k] != *b {
                         self.send(Cmd::SwapMap(k, b.clone()));
                     }
                 }
             }
-            _ => self.send(Cmd::SetContent(Content { form: self.form, displacement: self.displacement, maps: maps.clone(), white })),
+            _ => self.send(Cmd::SetContent(Content { form: self.form, displacement: self.displacement, maps: (*maps).clone(), white })),
         }
         self.slots = Some(maps);
         self.white = white;
@@ -398,6 +403,24 @@ impl App {
             });
             ui.separator();
         }
+        // Every tab and both views: it is about the sliders in the left column.
+        let row = Row {
+            name: "Update delay",
+            range: 0.0..=settle::REST_MAX as f32,
+            default: settle::REST as f32,
+            help: "While you hold a slider, the maps are made again once it has rested this long. Letting go makes them at once. 0 makes them on every move, which can make a slider stick on large maps.",
+            scale: 1.0,
+            suffix: " s",
+            decimals: 2,
+            log: false,
+        };
+        let before = settle::rest(ui.ctx()) as f32;
+        let mut delay = before;
+        slider_row(ui, &row, &mut delay);
+        if delay != before {
+            settle::set_rest(ui.ctx(), f64::from(delay));
+        }
+        ui.separator();
         ui.small("Community Shaders");
         ui.add(egui::Label::new(egui::RichText::new(&self.shaders_label).small()).truncate());
         if let Some((name, warp)) = &self.adapter {

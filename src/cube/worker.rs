@@ -20,6 +20,8 @@ pub struct Output {
     pub n: u32,
     /// Linear light, after every step.
     pub cube: Cube,
+    /// The 3D preview's map, packed on the cube thread; `None` from `compute` alone.
+    pub preview: Option<Arc<crate::preview_maps::Maps>>,
 }
 
 /// What an import reads: the face fix only for types with cells, the bottom turn only for a vertical cross.
@@ -99,7 +101,14 @@ pub(crate) fn compute(job: &Job, cache: &mut Cache) -> Output {
     }
     let mut cube = cache.shaped.as_ref().expect("filled above").1.clone();
     tone(&mut cube, s);
-    Output { id: job.id, n, cube }
+    Output { id: job.id, n, cube, preview: None }
+}
+
+/// `compute` with the preview's map packed: what the cube thread sends, so the UI thread packs nothing.
+pub(crate) fn finish(job: &Job, cache: &mut Cache) -> Output {
+    let mut o = compute(job, cache);
+    o.preview = Some(Arc::new(crate::preview_maps::cube_only(&o.cube)));
+    o
 }
 
 /// The cube thread. Before each job it drops every older queued job; `repaint` runs after each output.
@@ -112,7 +121,7 @@ pub fn spawn(repaint: impl Fn() + Send + 'static) -> (Sender<Job>, Receiver<Arc<
             let mut cache = Cache::default();
             while let Ok(first) = job_rx.recv() {
                 let job = job_rx.try_iter().last().unwrap_or(first);
-                if out_tx.send(Arc::new(compute(&job, &mut cache))).is_err() {
+                if out_tx.send(Arc::new(finish(&job, &mut cache))).is_err() {
                     break;
                 }
                 repaint();
@@ -173,6 +182,13 @@ mod tests {
 
     fn base() -> Settings {
         Settings { source: Some(SourceType::Panorama), ..Settings::default() }
+    }
+
+    #[test]
+    fn the_thread_packs_the_preview_cube() {
+        let o = finish(&with(&panorama(), Settings { side: Some(16), ..base() }), &mut Cache::default());
+        let maps = o.preview.as_ref().expect("a packed map");
+        assert_eq!(**maps, crate::preview_maps::cube_only(&o.cube));
     }
 
     #[test]

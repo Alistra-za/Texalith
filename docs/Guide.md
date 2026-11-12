@@ -35,7 +35,7 @@ The AO is estimated from the normal, not baked from a mesh. If you have a real h
 
 ## Blend normal layers (RNM tab)
 
-1. Click **Open base…** and pick the base normal (`_n` or `_cnr`). Model-space normals (`_msn`) are refused. Layer files beside the base whose names end in `_bump`, `_detail`, `_detailnorm` or `_bent` (also with `2`, and with `mask` for masks) are added as layers.
+1. Click **Open base…** and pick the base normal (`_n` or `_cnr`). Model-space normals (`_msn`) are refused. The base can be up to 8192 on a side: the blend is saved at the base's size, the 3D preview shows an 8192 blend at 4096, and each open 8192 image takes about 1 GB of memory. Layer files beside the base whose names end in `_bump`, `_detail`, `_detailnorm` or `_bent` (also with `2`, and with `mask` for masks) are added as layers.
 2. Click **Add layer** for each further layer, and choose its file.
 3. Set each layer's strength. Reorder with the drag handle or the arrows: layers blend from the top down, so each layer sits over the ones above it.
 4. Pick a folder under **Save to** and click **Save**. The button's hover text shows the file name.
@@ -81,6 +81,7 @@ A source larger than 8192 px on a side is halved until it fits.
 - **3D** and **2D**, above the centre view, switch it between the lit form and the flat map.
 - **Form** picks **Sphere**, **Plane**, **Cube** or **Material ball**. Drag to orbit, scroll to zoom, double-click to reset, or click **Reset view**.
 - **Parallax scale** changes how deep the parallax map looks in the preview only. It is not saved.
+- **Update delay** is how long a slider in the left column must rest, while you hold it, before the maps are made again. It starts at 0.2 s and goes up to 1 s. Letting go of the slider makes the maps at once. Raise it if sliders stick on large maps; at 0 the maps are made on every move.
 - **Community Shaders** names the shader build the preview draws with. Texalith ships that build and its settings, and never reads your own Community Shaders install: I want a map to look the same on every machine.
 - **GPU** names the graphics adapter. If the graphics device is lost, Texalith restarts itself; maps that were not saved are gone.
 
