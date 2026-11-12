@@ -1,0 +1,8 @@
+# The Community Shaders files Texalith previews with. Re-pinning is a decision, not an update.
+# The files in shaders/ are unmodified copies, made by tools/make_cs_bundle.py. If one ever changes, mark and date it.
+build = "CommunityShaders_AIO-2026-10-03T06-46Z"
+version = "d2026.10.11.0"
+# Upstream commit the files in licenses/ came from. The AIO build itself has no Licenses folder.
+license_commit = "a984db90b7e60eab8eac0fa09627f128dd59dedf"
+# render3d::locate::fingerprint of shaders/. tests/bundle.rs fails when this and the folder disagree.
+fingerprint = "a3ff8c7485cf4eab62fd8dcb7a59aecdc7b6ae43a392e53344ce472caca39e46"

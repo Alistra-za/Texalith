@@ -1,0 +1,10 @@
+{
+  "Extended Materials": {
+    "EnableParallax": 1,
+    "EnableShadows": 1,
+    "EnableParallaxWarpingFix": 1
+  },
+  "Linear Lighting": {
+    "enableLinearLighting": 1
+  }
+}

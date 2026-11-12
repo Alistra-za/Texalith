@@ -1,0 +1,47 @@
+[package]
+name = "texalith"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+rust-version = "1.95"
+
+[workspace]
+
+[dependencies]
+# Tessalith's crates at one pinned commit, the last of 2.1. The three revs must be the same. Texalith does not build against Tessalith 3.0 yet.
+render3d = { git = "https://github.com/Alistra-za/Tessalith", rev = "10877c467f0d515dd8c89439f2671310a9827d32" }
+nif = { git = "https://github.com/Alistra-za/Tessalith", rev = "10877c467f0d515dd8c89439f2671310a9827d32" }
+# shortcut: egui's default fonts, swap for system fonts as Tessalith does when the UI needs wider glyph coverage.
+eframe = { version = "=0.36.2", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+# The from_normal FFT and AO march, as in Tessalith's engine.
+rayon = "1.12"
+# load_image, Rgba32F, pot_dims, may_replace, write_atomic (report: "What Texalith still needs from engine").
+engine = { git = "https://github.com/Alistra-za/Tessalith", rev = "10877c467f0d515dd8c89439f2671310a9827d32" }
+# The marked 16-bit PNGs: png writes the iTXt chunk, which image cannot.
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+# Open and folder dialogs, the version Tessalith pins.
+rfd = "=0.17.2"
+
+[dev-dependencies]
+egui_kittest = "=0.36.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Same as Tessalith: encoders-sys is too slow without opt-level 3, and engine's encoders run in dev builds.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.encoders-sys]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

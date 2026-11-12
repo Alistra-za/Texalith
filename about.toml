@@ -1,0 +1,24 @@
+# cargo-about config for THIRD_PARTY_LICENSES.md (regenerate command: see THIRD_PARTY_NOTICES.md).
+# Order matters: for a crate offering a choice (SPDX OR) cargo-about picks the first accepted licence in this
+# list, so MIT is preferred, then Apache-2.0, then the rest. GPL-2.0-only is not accepted: it is incompatible
+# with GPL-3.0.
+accepted = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "BSD-2-Clause",
+  "Zlib",
+  "ISC",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "0BSD",
+  "Unlicense",
+  # egui's bundled fonts (epaint_default_fonts): font files shipped as data inside the exe.
+  "OFL-1.1",
+  "Ubuntu-font-1.0",
+]
+targets = ["x86_64-pc-windows-msvc"]
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+# Texalith and the Tessalith crates it links (publish = false) are not third-party; THIRD_PARTY_NOTICES.md names them.
+private = { ignore = true }

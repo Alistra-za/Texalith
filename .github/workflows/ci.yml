@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the channel, target and components pinned in rust-toolchain.toml.
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # Cargo fetches the Tessalith crates at the commit pinned in Cargo.toml.
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # The preview tests (tests/bundle.rs) draw with the WARP software adapter here: the runner has no GPU.
+      # Tests that need the owner's files are #[ignore]d.
+      # --no-fail-fast: one failing test binary must not hide failures in the binaries after it.
+      - run: cargo test --locked --no-fail-fast -- --test-threads=2

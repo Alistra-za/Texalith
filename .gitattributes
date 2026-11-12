@@ -1,0 +1,3 @@
+# The bundled Community Shaders files are hashed (PIN.toml, tests/bundle.rs) and shipped unmodified:
+# no line-ending conversion on any machine.
+assets/cs-shaders/** -text

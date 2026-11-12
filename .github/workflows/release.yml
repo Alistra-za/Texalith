@@ -1,0 +1,33 @@
+name: Release build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # Builds texalith.exe in release, then writes dist/Texalith-<version>-win-x64.zip and dist/SHA256SUMS.txt.
+      - name: Build and package
+        run: tools/package-release.ps1
+        shell: pwsh
+      # The zip is uploaded as a workflow artifact. Publishing a GitHub release from it is done by hand.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: texalith-win-x64
+          path: |
+            dist/Texalith-*-win-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
