@@ -16,20 +16,20 @@ nif = { git = "https://github.com/Alistra-za/Tessalith", rev = "10877c467f0d515d
 eframe = { version = "=0.36.2", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
 # The from_normal FFT and AO march, as in Tessalith's engine.
 rayon = "1.12"
-# load_image, Rgba32F, pot_dims, may_replace, write_atomic (report: "What Texalith still needs from engine").
+# load_image, Rgba32F, pot_dims, write_atomic (report: "What Texalith still needs from engine").
 engine = { git = "https://github.com/Alistra-za/Tessalith", rev = "10877c467f0d515dd8c89439f2671310a9827d32" }
 # The marked 16-bit PNGs: png writes the iTXt chunk, which image cannot.
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-hex = "0.4"
 # Open and folder dialogs, the version Tessalith pins.
 rfd = "=0.17.2"
 
 [dev-dependencies]
 egui_kittest = "=0.36.2"
-image = { version = "0.25", default-features = false, features = ["png"] }
+# exr: the float files of the infinite-and-NaN tests. Tessalith's engine already builds image with it.
+image = { version = "0.25", default-features = false, features = ["png", "exr"] }
 
 # Same as Tessalith: encoders-sys is too slow without opt-level 3, and engine's encoders run in dev builds.
 [profile.dev]

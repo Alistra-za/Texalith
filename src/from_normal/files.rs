@@ -41,7 +41,7 @@ pub struct Source {
 /// `path` with the SHA-256 of its bytes.
 pub fn source(path: &Path) -> std::io::Result<Source> {
     let bytes = std::fs::read(path)?;
-    Ok(Source { path: path.to_path_buf(), sha256: hex::encode(Sha256::digest(&bytes)) })
+    Ok(Source { path: path.to_path_buf(), sha256: format!("{:x}", Sha256::digest(&bytes)) })
 }
 
 fn marker(kind: MapKind, src: &Source, settings: serde_json::Value) -> Marker {

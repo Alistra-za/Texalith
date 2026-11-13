@@ -5,6 +5,7 @@ use super::master::{Green, Master};
 use super::solve::curvature_lines;
 use super::{dims, percentile, AoOpts};
 use engine::image::Rgba32F;
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 /// One grey value per texel, row-major, 0 to 1.
@@ -228,7 +229,7 @@ fn height_at(m: &Master, long: u32, depth: f32) -> (u32, u32, Vec<f64>) {
         px: m.h.iter().map(|&v| [v as f32, 0.0, 0.0, 1.0]).collect(),
     };
     let k = d * f64::from(w) / f64::from(m.width);
-    let px = crate::resample::resample(img, (w, h)).px.iter().map(|p| f64::from(p[0]) * k).collect();
+    let px = crate::resample::resample(&img, (w, h)).px.iter().map(|p| f64::from(p[0]) * k).collect();
     (w, h, px)
 }
 
@@ -239,6 +240,14 @@ pub fn ao(m: &Master, o: &AoSettings, long: u32, progress: &AtomicU32, cancel: &
     let opts = AoOpts { radius: o.reach, slices: 8, steps: 16, depth: o.surface_depth, intensity: o.darkness };
     let px = march_with_progress(&h, width, height, m.wrap, &opts, progress, cancel)?;
     Some(Gray { width, height, px })
+}
+
+/// AO made at strength 1, raised to `darkness`: what the march does with its own power, to within one f32 step.
+pub fn darken(mut g: Gray, darkness: f32) -> Gray {
+    if darkness != 1.0 {
+        g.px.par_iter_mut().for_each(|v| *v = v.powf(darkness));
+    }
+    g
 }
 
 /// The default crevice width in texels: `width / 128`, within 2..=16.

@@ -2,6 +2,7 @@
 //! `crates/engine/src/rnm/blend.rs` (GPL-3.0); `apply` takes images already in memory instead of loading files.
 //! Alpha is never written, so a `_cnr`'s coat roughness passes through.
 use super::{Input, Kind};
+use crate::from_normal::maps::Gray;
 use crate::resample::resample;
 use engine::image::Rgba32F;
 use rayon::prelude::*;
@@ -72,22 +73,28 @@ pub fn decode_base(img: &Rgba32F) -> Rgba32F {
     Rgba32F { width: img.width, height: img.height, px }
 }
 
-/// Unit vectors back to stored texels, `(v + 1) / 2`, alpha kept.
-pub fn encode(work: &Rgba32F) -> Vec<[f32; 4]> {
-    work.px.iter().map(|p| [(p[0] + 1.0) / 2.0, (p[1] + 1.0) / 2.0, (p[2] + 1.0) / 2.0, p[3]]).collect()
+/// Unit vectors back to stored texels, `(v + 1) / 2`, alpha kept. The work image's own buffer becomes the output: at
+/// 8192 a second one is a gigabyte.
+pub fn encode(work: Rgba32F) -> Vec<[f32; 4]> {
+    let mut px = work.px;
+    px.par_iter_mut().for_each(|p| put(p, [(p[0] + 1.0) / 2.0, (p[1] + 1.0) / 2.0, (p[2] + 1.0) / 2.0]));
+    px
 }
 
-fn sized(img: &Rgba32F, size: (u32, u32)) -> Cow<'_, Rgba32F> {
-    if (img.width, img.height) == size {
-        Cow::Borrowed(img)
-    } else {
-        Cow::Owned(resample(img.clone(), size))
+/// The red channel of `img`: all the blend reads of a mask or an AO map, at a quarter of the memory.
+pub fn red(img: &Rgba32F) -> Gray {
+    Gray { width: img.width, height: img.height, px: img.px.iter().map(|p| p[0]).collect() }
+}
+
+/// `g` at `size`: its own texels when the size is the blend's, as a mask made for the base has.
+// shortcut: another size goes through the four-channel `resample`; give that a one-channel path if small masks on an
+// 8192 base turn out slow.
+fn plane(g: &Gray, size: (u32, u32)) -> Cow<'_, [f32]> {
+    if (g.width, g.height) == size {
+        return Cow::Borrowed(&g.px);
     }
-}
-
-/// One channel of `img` at `size`, clamped to 0..1.
-fn plane(img: &Rgba32F, size: (u32, u32), channel: usize) -> Vec<f32> {
-    sized(img, size).px.iter().map(|p| p[channel].clamp(0.0, 1.0)).collect()
+    let wide = Rgba32F { width: g.width, height: g.height, px: g.px.iter().map(|&v| [v, 0.0, 0.0, 1.0]).collect() };
+    Cow::Owned(resample(&wide, size).px.iter().map(|p| p[0]).collect())
 }
 
 fn put(px: &mut [f32; 4], v: V3) {
@@ -100,11 +107,13 @@ pub fn apply(work: &mut Rgba32F, layers: &[Input]) {
     work.px.par_iter_mut().for_each(|px| put(px, unit([px[0], px[1], px[2]])));
     for l in layers {
         let (k, flip) = (l.set.strength, l.set.flip);
-        let mask = l.mask.as_ref().map(|m| plane(m, size, 0));
-        let m = |i: usize| mask.as_ref().map_or(1.0, |v| v[i]);
+        let mask = l.mask.as_ref().map(|m| plane(m, size));
+        // A float mask can hold any value; the blend reads 0 to 1.
+        let m = |i: usize| mask.as_ref().map_or(1.0, |v| v[i].clamp(0.0, 1.0));
         match l.set.kind {
             Kind::Bump => {
-                let n = resample(bump_normals(&l.img, k), size);
+                let bump = bump_normals(&l.img, k);
+                let n = resample(&bump, size);
                 work.px.par_iter_mut().enumerate().for_each(|(i, px)| {
                     let q = n.px[i];
                     let mut d = unit([q[0], if flip { -q[1] } else { q[1] }, q[2]]);
@@ -117,9 +126,9 @@ pub fn apply(work: &mut Rgba32F, layers: &[Input]) {
                 });
             }
             Kind::Bent => {
-                let src = sized(&l.img, size);
+                let src = resample(&l.img, size);
                 let ao = match (&l.ao, l.set.use_ao) {
-                    (Some((a, channel)), true) => Some(plane(a, size, *channel)),
+                    (Some(a), true) => Some(plane(a, size)),
                     _ => None,
                 };
                 work.px.par_iter_mut().enumerate().for_each(|(i, px)| {
@@ -139,7 +148,7 @@ pub fn apply(work: &mut Rgba32F, layers: &[Input]) {
                 });
             }
             Kind::Detail => {
-                let src = sized(&l.img, size);
+                let src = resample(&l.img, size);
                 work.px.par_iter_mut().enumerate().for_each(|(i, px)| {
                     put(px, rnm([px[0], px[1], px[2]], decode(src.px[i], k * m(i), flip)));
                 });
@@ -202,7 +211,7 @@ mod tests {
 
     /// `v` with `mask` on its last layer.
     fn masked(mut v: Vec<Input>, mask: Arc<Rgba32F>) -> Vec<Input> {
-        v.last_mut().expect("a layer").mask = Some(mask);
+        v.last_mut().expect("a layer").mask = Some(Arc::new(red(&mask)));
         v
     }
 
@@ -296,17 +305,16 @@ mod tests {
             let b = decode(*c, 1.0, false);
             put(px, unit([px[0] * (1.0 - k) + b[0] * k, px[1] * (1.0 - k) + b[1] * k, px[2] * (1.0 - k) + b[2] * k]));
         }
-        let with_ao = |rgba: [f32; 4], channel: usize, use_ao: bool| {
+        // The AO map is its file's red channel.
+        let with_ao = |rgba: [f32; 4], use_ao: bool| {
             let mut i = one(Kind::Bent, src.clone());
-            i[0].ao = Some((solid(rgba), channel));
+            i[0].ao = Some(Arc::new(red(&solid(rgba))));
             i[0].set.use_ao = use_ao;
             run(&i)
         };
-        assert!(max_diff(&with_ao([1.0, 0.0, 0.0, 1.0], 0, true), &none) < 1e-5);
-        assert!(max_diff(&with_ao([0.0, 1.0, 1.0, 1.0], 0, true), &weighted) < 1e-4);
-        assert!(max_diff(&with_ao([0.0, 0.0, 1.0, 1.0], 2, true), &none) < 1e-5);
-        assert!(max_diff(&with_ao([1.0, 1.0, 0.0, 1.0], 2, true), &weighted) < 1e-4);
-        assert!(max_diff(&with_ao([1.0; 4], 0, false), &weighted) < 1e-4);
+        assert!(max_diff(&with_ao([1.0, 0.0, 0.0, 1.0], true), &none) < 1e-5);
+        assert!(max_diff(&with_ao([0.0, 1.0, 1.0, 1.0], true), &weighted) < 1e-4);
+        assert!(max_diff(&with_ao([1.0; 4], false), &weighted) < 1e-4);
         assert!(max_diff(&weighted, &none) > 1e-3);
     }
 
@@ -340,6 +348,16 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_outside_0_to_1_counts_as_0_or_1() {
+        // A float mask can hold any value.
+        let detail = one(Kind::Detail, img(16, 16, textured));
+        let with = |v: f32| run(&masked(detail.clone(), solid([v, 0.0, 0.0, 1.0])));
+        assert!(max_diff(&with(3.0), &with(1.0)) < 1e-6);
+        assert!(max_diff(&with(-2.0), &with(0.0)) < 1e-6);
+        assert!(max_diff(&with(1.0), &with(0.0)) > 1e-3);
+    }
+
+    #[test]
     fn apply_follows_the_order() {
         let (d1, d2) = (img(16, 16, textured), img(16, 16, |x, y| textured(15 - y, x)));
         let a = Input { set: Layer::new(Kind::Detail), img: d1.clone(), mask: None, ao: None };
@@ -366,7 +384,7 @@ mod tests {
     fn layers_of_any_size_are_resampled_to_the_base() {
         let wave = |a: f32| move |x: u32, y: u32| [0.5 + 0.3 * (x as f32 * a).sin(), 0.5 + 0.3 * (y as f32 * a).cos(), 0.9, 1.0];
         let mut i = one(Kind::Bent, img(16, 16, wave(0.2)));
-        i[0].ao = Some((img(48, 48, |x, _| [x as f32 / 47.0; 4]), 0));
+        i[0].ao = Some(Arc::new(red(&img(48, 48, |x, _| [x as f32 / 47.0; 4]))));
         i.extend(one(Kind::Bump, img(24, 24, wave(0.4))));
         i.extend(masked(one(Kind::Detail, img(64, 64, wave(0.7))), img(7, 5, |x, _| [x as f32 / 6.0, 0.0, 0.0, 1.0])));
         let mut w = base(32);
@@ -388,7 +406,7 @@ mod tests {
 
     #[test]
     fn ao_is_ignored_off_a_bent_layer_or_with_bend_in_shadows_off() {
-        let ao = (img(16, 16, |x, y| [(x * y) as f32 / 225.0, 0.0, 0.0, 1.0]), 0);
+        let ao = Arc::new(red(&img(16, 16, |x, y| [(x * y) as f32 / 225.0, 0.0, 0.0, 1.0])));
         let mut i = one(Kind::Bump, img(16, 16, textured));
         i.extend(one(Kind::Detail, img(16, 16, |x, y| textured(y, x))));
         let without = run(&i);
@@ -409,7 +427,7 @@ mod tests {
         assert_eq!(d.px, vec![[0.0, 0.0, 1.0, 0.3], [1.0, 0.0, 0.0, 1.0]]);
         let n = unit([0.3, -0.2, 0.9]);
         let x = img(1, 1, |_, _| [(n[0] + 1.0) / 2.0, (n[1] + 1.0) / 2.0, (n[2] + 1.0) / 2.0, 0.7]);
-        let back = encode(&decode_base(&x));
+        let back = encode(decode_base(&x));
         for c in 0..3 {
             assert!((back[0][c] - x.px[0][c]).abs() < 1e-6, "{back:?}");
         }
@@ -428,7 +446,7 @@ mod tests {
     #[test]
     fn each_bent_layer_reads_its_own_ao() {
         let src = img(16, 16, textured);
-        let bent = |ao: f32| Input { set: Layer::new(Kind::Bent), img: src.clone(), mask: None, ao: Some((solid([ao, 0.0, 0.0, 1.0]), 0)) };
+        let bent = |ao: f32| Input { set: Layer::new(Kind::Bent), img: src.clone(), mask: None, ao: Some(Arc::new(red(&solid([ao, 0.0, 0.0, 1.0])))) };
         let open = run(&[bent(0.0)]);
         // The first layer's AO is white, so its weight is 0 and only the second bends the base.
         assert!(max_diff(&run(&[bent(1.0), bent(0.0)]), &open) < 1e-6);

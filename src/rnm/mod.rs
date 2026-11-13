@@ -1,4 +1,5 @@
 //! The RNM tab: blend bent, bump and detail layers into a base tangent normal.
+use crate::from_normal::maps::Gray;
 use engine::image::Rgba32F;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -57,11 +58,11 @@ impl Layer {
     }
 }
 
-/// One layer of a blend: its settings and images. `ao` carries the channel it is read from.
+/// One layer of a blend: its settings and images. A mask and an AO map are one channel each (`blend::red`).
 #[derive(Clone)]
 pub struct Input {
     pub set: Layer,
     pub img: Arc<Rgba32F>,
-    pub mask: Option<Arc<Rgba32F>>,
-    pub ao: Option<(Arc<Rgba32F>, usize)>,
+    pub mask: Option<Arc<Gray>>,
+    pub ao: Option<Arc<Gray>>,
 }

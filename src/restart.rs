@@ -60,20 +60,27 @@ pub fn restart_on_lost_panic(args: Vec<OsString>) {
     }));
 }
 
-/// shortcut: nothing to save yet, add it here before restarting once Texalith holds unsaved work.
+/// Says why the app is about to close: a release build has no console, so without this the window just vanishes.
+/// Blocks until the box is closed, so no test may reach it.
+pub fn fatal(text: &str) {
+    eprintln!("{text}");
+    rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("Texalith").set_description(text).show();
+}
+
+/// shortcut: a save running at this moment is cut off (each file is whole, a set of maps may be half new); wait for
+/// `save::wait` here if that is ever seen. It must not wait without a limit: this also runs inside a panic.
 pub fn restart_and_exit(args: &[OsString]) -> ! {
     eprintln!("Texalith: graphics device lost ({})", reason());
     let uptime = STARTED.get().map(Instant::elapsed).unwrap_or_default();
     if should_restart(is_restart(), uptime) {
         let spawned = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(args).arg(FLAG).spawn());
         if let Err(e) = spawned {
-            eprintln!("Texalith: could not restart: {e}");
+            fatal(&format!("Texalith lost the graphics device and could not start itself again: {e}"));
             std::process::exit(1);
         }
         std::process::exit(0);
     }
-    // shortcut: stderr only, show a dialog when the release build drops the console window.
-    eprintln!("Texalith: lost the graphics device again within a minute, not restarting");
+    fatal("Texalith lost the graphics device twice within a minute, so it will close. Update the graphics driver, then start Texalith again.");
     std::process::exit(1);
 }
 

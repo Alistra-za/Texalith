@@ -15,7 +15,7 @@ Release from `main` only. The owner's local `master` holds research files in its
 7. If the emblem (`docs/assets/texalith-emblem.png`, hand-made) changed: `py -3 -I tools/make_icon.py` cuts the icon files in `assets` from its X.
 8. If the Community Shaders copy was re-pinned: `assets/cs-shaders/PIN.toml` and the files in `assets/cs-shaders/licenses` match the new build.
 9. Commit, push, and wait for the **CI** workflow to pass.
-10. Tag `v<version>` and push the tag. The **Release build** workflow uploads `Texalith-<version>-win-x64.zip` and `SHA256SUMS.txt` as an artifact.
+10. Tag `v<version>` and push the tag. The **Release build** workflow uploads `Texalith-<version>-win-x64.zip` and `SHA256SUMS.txt` as an artifact. It stops when the tag and the `Cargo.toml` version differ.
 11. Download the artifact, unzip it to a new folder, run `texalith.exe`, and save one map from each tab.
 12. Create the GitHub release from the tag by hand: attach the zip and `SHA256SUMS.txt`, paste the version's changelog section.
 

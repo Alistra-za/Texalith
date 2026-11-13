@@ -108,7 +108,7 @@ fn resize(s: &Slopes, size: (u32, u32)) -> Slopes {
         height: s.height,
         px: s.p.iter().zip(&s.q).map(|(&p, &q)| [p as f32, q as f32, 0.0, 0.0]).collect(),
     };
-    let r = resample(img, size);
+    let r = resample(&img, size);
     Slopes {
         width: size.0,
         height: size.1,
@@ -173,7 +173,7 @@ pub fn build(img: &Rgba32F, kind: &Kind, o: &MasterOpts, cancel: &AtomicBool) ->
             (h, s)
         }
         Kind::Height { span_texels } => {
-            let d: Vec<f64> = resample(img.clone(), size).px.iter().map(|p| f64::from(p[0])).collect();
+            let d: Vec<f64> = resample(img, size).px.iter().map(|p| f64::from(p[0])).collect();
             let span = match span_texels {
                 Some(t) => t * f64::from(size.0) / f64::from(src.0),
                 None => f64::from(o.normal_depth_pct) / 100.0 * f64::from(size.0),

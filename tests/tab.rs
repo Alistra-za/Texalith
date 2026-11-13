@@ -389,6 +389,29 @@ const BACKUP: &str = "Keep a backup in _sdc\\texalith-backup";
 fn press(h: &mut Harness<'_, Tab>, label: &str) {
     h.get_by_role_and_label(Role::Button, label).click_accesskit();
     h.run_steps(2);
+    saved(h);
+}
+
+/// Steps until the running save has finished and its result is shown.
+fn saved(h: &mut Harness<'_, Tab>) {
+    let start = std::time::Instant::now();
+    while h.state().saving.is_some() {
+        assert!(start.elapsed().as_secs() < 300, "the save never finished");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+}
+
+/// A save that waits for the returned sender, then has nothing to write.
+fn held_save(ctx: &egui::Context) -> (std::sync::mpsc::Sender<()>, texalith::save::Saving) {
+    let (gate, wait) = std::sync::mpsc::channel();
+    let say = Box::new(|w, k| format!("{w} written, {k} kept"));
+    let s = texalith::save::start(ctx, vec![], say, move || {
+        let _ = wait.recv();
+        vec![]
+    });
+    (gate, s)
 }
 
 fn toggled(h: &Harness<'_, Tab>, role: Role, label: &str) -> Option<egui::accesskit::Toggled> {
@@ -474,7 +497,8 @@ fn opening_another_file_closes_the_dialog() {
     let old = foreign(&dir);
     press(&mut h, "Save 3 maps");
     assert!(label_exists(&h, REVIEW));
-    h.state_mut().accept(normal_source("reopen-other"));
+    let (other, ctx) = (normal_source("reopen-other").path, h.ctx.clone());
+    h.state_mut().start_open(other, &ctx);
     h.run_steps(2);
     assert!(h.state().review.is_none());
     assert!(!label_exists(&h, REVIEW));
@@ -774,4 +798,163 @@ fn picking_a_preset_leaves_its_section_open() {
     assert_eq!(h.state().settings.as_ref().unwrap().master.flatten, v);
     h.get_by_role_and_label(Role::Button, "Hide Height data settings");
     h.get_by_role_and_label(Role::Slider, "Flatten broad shapes");
+}
+
+#[test]
+fn match_the_normal_keeps_the_exact_depth() {
+    let (mut h, rig) = rig(1280.0);
+    h.state_mut().accept(normal_source("match"));
+    h.run_steps(2);
+    let id = h.state().jobs_sent;
+    // 1.465 %: between two whole percents, which is all the Depth slider shows.
+    rig.replies.send(Reply::Done(Box::new(Outputs { match_depth: 0.01465, ..outputs(id) }))).unwrap();
+    h.run_steps(2);
+    jobs(&rig);
+    h.get_by_role_and_label(Role::Button, "Match the normal").click_accesskit();
+    h.run_steps(4);
+    assert_eq!(h.state().settings.as_ref().unwrap().parallax.depth, 0.01465);
+    let sent = jobs(&rig);
+    assert_eq!(sent.len(), 1, "one job for the matched depth, none for a rounded copy of it");
+    assert_eq!(sent[0].settings.parallax.depth, 0.01465);
+}
+
+#[test]
+fn a_value_that_comes_back_after_its_job_was_stopped_is_sent_again() {
+    let (mut h, rig) = rig_dt(1280.0, 1.0 / 60.0);
+    h.state_mut().accept(normal_source("back"));
+    h.run_steps(2);
+    let first = jobs(&rig).pop().expect("the job for the opened file"); // still running: no reply
+    // The button is held (on nothing), so a changed value waits and the running job is stopped.
+    let held = egui::pos2(900.0, 450.0);
+    h.drag_at(held);
+    h.step();
+    h.state_mut().settings.as_mut().unwrap().parallax.depth = 0.5;
+    h.run_steps(2);
+    assert!(first.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    h.state_mut().settings = Some(first.settings.clone());
+    h.step();
+    h.drop_at(held);
+    h.run_steps(2);
+    let again = jobs(&rig).pop().expect("the stopped job's value has no result, so it is sent again");
+    assert_eq!(again.settings, first.settings);
+}
+
+#[test]
+fn a_value_that_comes_back_with_its_result_on_screen_sends_no_job() {
+    let (mut h, rig) = rig_dt(1280.0, 1.0 / 60.0);
+    h.state_mut().accept(normal_source("back-shown"));
+    h.run_steps(2);
+    let first = jobs(&rig).pop().unwrap();
+    rig.replies.send(Reply::Done(Box::new(outputs(first.id)))).unwrap();
+    h.run_steps(2);
+    let held = egui::pos2(900.0, 450.0);
+    h.drag_at(held);
+    h.step();
+    h.state_mut().settings.as_mut().unwrap().parallax.depth = 0.5;
+    h.run_steps(2);
+    h.state_mut().settings = Some(first.settings.clone());
+    h.step();
+    h.drop_at(held);
+    h.run_steps(2);
+    assert!(jobs(&rig).is_empty(), "these settings have their result on screen already");
+    assert!(!h.state().running());
+}
+
+#[test]
+fn stopping_a_job_clears_its_progress() {
+    let (mut h, rig) = rig_dt(1280.0, 1.0 / 60.0);
+    h.state_mut().accept(normal_source("progress"));
+    h.run_steps(2);
+    let first = jobs(&rig).pop().unwrap();
+    first.progress.store(600, std::sync::atomic::Ordering::Relaxed);
+    h.run_steps(2);
+    let bar = |h: &Harness<'_, Tab>| h.get_by_role(Role::ProgressIndicator).accesskit_node().numeric_value();
+    assert_eq!(bar(&h), Some(60.0));
+    let held = egui::pos2(900.0, 450.0);
+    h.drag_at(held);
+    h.step();
+    h.state_mut().settings.as_mut().unwrap().parallax.depth = 0.5;
+    h.run_steps(2);
+    assert!(first.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(bar(&h), Some(0.0), "the stopped job's 60 % is not the next job's progress");
+}
+
+#[test]
+fn save_is_off_while_a_save_runs() {
+    let (mut h, _rig, _dir) = ready("saving");
+    let off = |h: &Harness<'_, Tab>, l: &str| h.get_by_role_and_label(Role::Button, l).accesskit_node().is_disabled();
+    assert!(!off(&h, "Save 3 maps") && !off(&h, "Save AO"));
+    let (gate, saving) = held_save(&h.ctx);
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    assert!(off(&h, "Save 3 maps") && off(&h, "Save AO"));
+    assert!(label_exists(&h, "Saving…"));
+    gate.send(()).unwrap();
+    saved(&mut h);
+    assert!(!off(&h, "Save 3 maps") && !label_exists(&h, "Saving…"));
+    assert_eq!(h.state().status, Some(Ok("0 written, 0 kept".into())));
+}
+
+#[test]
+fn a_save_still_asks_after_another_file_is_opened() {
+    let (mut h, _rig, dir) = ready("saving-open");
+    // A held save whose one file is on disk and not Texalith's, so it ends in a question.
+    let path = dir.join("taken.png");
+    std::fs::write(&path, b"someone else's file").unwrap();
+    let (gate, wait) = channel::<()>();
+    let say = Box::new(|w, k| format!("{w} written, {k} kept, as pressed"));
+    let saving = texalith::save::start(&h.ctx, vec![], say, move || {
+        let _ = wait.recv();
+        vec![(MapKind::Ao, texalith::export::Planned { path, bytes: vec![1, 2, 3] })]
+    });
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    h.state_mut().accept(normal_source("saving-open-other"));
+    assert!(h.state().saving.is_some(), "the save still runs, so Save stays off until it answers");
+    gate.send(()).unwrap();
+    saved(&mut h);
+    assert!(label_exists(&h, REVIEW), "the question is asked, not dropped");
+    // The status line is the one of the Save press, not one made from the file open now. The dialog's Save is the
+    // one that is on: the column's waits for the new file's maps.
+    let on = |b: &egui_kittest::Node<'_>| b.accesskit_node().label().as_deref() == Some("Save") && !b.accesskit_node().is_disabled();
+    h.query_all_by_role(Role::Button).find(on).expect("the dialog's Save").click_accesskit();
+    h.run_steps(2);
+    saved(&mut h);
+    assert_eq!(h.state().status, Some(Ok("0 written, 1 kept, as pressed".into())));
+    assert_eq!(std::fs::read(dir.join("taken.png")).unwrap(), b"someone else's file");
+}
+
+#[test]
+fn a_file_still_being_read_already_counts_as_open() {
+    // Another tab's Save asks for this list: a file picked here must be kept before its pixels have arrived.
+    let (mut h, _rig) = rig(1280.0);
+    let p = temp("opening").join("rock_n.png");
+    image::RgbImage::from_fn(64, 64, |x, _| image::Rgb([(120 + x) as u8, 128, 230])).save(&p).unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().start_open(p.clone(), &ctx);
+    assert_eq!(h.state().open_files(), vec![p]);
+}
+
+#[test]
+fn a_question_is_not_closed_by_the_arrival_of_a_file_picked_before_it() {
+    let (mut h, _rig, dir) = ready("saving-pick");
+    let path = dir.join("taken.png");
+    std::fs::write(&path, b"someone else's file").unwrap();
+    let (gate, wait) = channel::<()>();
+    let saving = texalith::save::start(&h.ctx, vec![], Box::new(|w, k| format!("{w} written, {k} kept")), move || {
+        let _ = wait.recv();
+        vec![(MapKind::Ao, texalith::export::Planned { path, bytes: vec![1, 2, 3] })]
+    });
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    // The save asks while the picked file is still being read.
+    gate.send(()).unwrap();
+    saved(&mut h);
+    assert!(label_exists(&h, REVIEW));
+    h.state_mut().status = Some(Err("a line from the save".into()));
+    // The file arrives.
+    h.state_mut().accept(normal_source("saving-pick-other"));
+    h.run_steps(2);
+    assert!(label_exists(&h, REVIEW), "the question is still there to answer");
+    assert_eq!(h.state().status, Some(Err("a line from the save".into())));
 }

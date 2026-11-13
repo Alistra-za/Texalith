@@ -9,7 +9,8 @@ use texalith::from_normal::open::{open, Opened};
 use texalith::from_normal::settings::{Settings, Ticks};
 use texalith::from_normal::worker::{compute, Cache, Job, Outputs};
 use texalith::marker::{self, MapKind};
-use texalith::save::{plan, review};
+use texalith::export::Planned;
+use texalith::save::{self, plan, review};
 
 fn temp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("texalith-save-{}-{name}", std::process::id()));
@@ -114,10 +115,10 @@ fn only_foreign_unreadable_or_source_rows_open_the_dialog() {
     let o = opened(&d);
     let s = with_height(&o);
     let out = outputs(&o, &s);
-    assert!(!review(plan(&o, &s, &out, &d), &o.path).needs_dialog());
+    assert!(!review(plan(&o, &s, &out, &d), std::slice::from_ref(&o.path)).needs_dialog());
 
     fs::write(d.join("rock_ao.png"), png_with(&[10, 20], None)).unwrap();
-    let r = review(plan(&o, &s, &out, &d), &o.path);
+    let r = review(plan(&o, &s, &out, &d), std::slice::from_ref(&o.path));
     assert!(r.needs_dialog() && r.backup);
     let ao = r.rows.iter().find(|row| row.kind == MapKind::Ao).unwrap();
     assert!(matches!(ao.verdict, Verdict::Foreign) && !ao.overwrite);
@@ -126,7 +127,7 @@ fn only_foreign_unreadable_or_source_rows_open_the_dialog() {
     let ours = &plan(&o, &s, &out, &d)[0].1.bytes;
     let edited = png_with(&[7, 9], Some(serde_json::to_string(&marker::read(ours).unwrap()).unwrap()));
     fs::write(d.join("rock_height.png"), edited).unwrap();
-    let r = review(plan(&o, &s, &out, &d), &o.path);
+    let r = review(plan(&o, &s, &out, &d), std::slice::from_ref(&o.path));
     let h = r.rows.iter().find(|row| row.kind == MapKind::HeightData).unwrap();
     assert_eq!(h.reason.as_deref(), Some("Made by Texalith, then changed"));
     fs::remove_dir_all(&d).unwrap();
@@ -141,14 +142,14 @@ fn a_kept_row_is_not_written_and_an_overwritten_one_is_backed_up() {
     let old = png_with(&[10, 20], None);
     fs::write(d.join("rock_ao.png"), &old).unwrap();
 
-    let r = review(plan(&o, &s, &out, &d), &o.path);
-    r.write(&o.path).unwrap();
+    let r = review(plan(&o, &s, &out, &d), std::slice::from_ref(&o.path));
+    r.write().unwrap();
     assert_eq!(fs::read(d.join("rock_ao.png")).unwrap(), old);
     assert!(d.join("rock_height.png").exists());
 
-    let mut r = review(plan(&o, &s, &out, &d), &o.path);
+    let mut r = review(plan(&o, &s, &out, &d), std::slice::from_ref(&o.path));
     r.rows.iter_mut().filter(|row| row.kind == MapKind::Ao).for_each(|row| row.overwrite = true);
-    r.write(&o.path).unwrap();
+    r.write().unwrap();
     assert_ne!(fs::read(d.join("rock_ao.png")).unwrap(), old);
     assert_eq!(fs::read(d.join("_sdc").join("texalith-backup").join("rock_ao.png")).unwrap(), old);
     fs::remove_dir_all(&d).unwrap();
@@ -166,9 +167,9 @@ fn a_failed_write_reports_the_path_and_leaves_no_partial_set() {
     perms.set_readonly(true);
     fs::set_permissions(&ao, perms.clone()).unwrap();
 
-    let mut r = review(plan(&o, &s, &out, &d), &o.path);
+    let mut r = review(plan(&o, &s, &out, &d), std::slice::from_ref(&o.path));
     r.rows.iter_mut().filter(|row| row.kind == MapKind::Ao).for_each(|row| row.overwrite = true);
-    let e = r.write(&o.path).unwrap_err();
+    let e = r.write().unwrap_err();
     assert!(e.contains("rock_ao.png"), "{e}");
     assert!(!d.join("rock_height.png").exists() && !d.join("rock_parallax.png").exists());
 
@@ -176,4 +177,85 @@ fn a_failed_write_reports_the_path_and_leaves_no_partial_set() {
     perms.set_readonly(false);
     fs::set_permissions(&ao, perms).unwrap();
     fs::remove_dir_all(&d).unwrap();
+}
+
+/// Polls until the save has ended.
+fn finish(saving: &mut Option<save::Saving>, review: &mut Option<save::Review>, status: &mut Option<Result<String, String>>) {
+    let start = std::time::Instant::now();
+    while saving.is_some() {
+        assert!(start.elapsed().as_secs() < 60, "the save never finished");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        save::poll(saving, review, status);
+    }
+}
+
+fn say() -> save::Say {
+    Box::new(|w, k| format!("{w} written, {k} kept"))
+}
+
+#[test]
+fn a_save_runs_on_its_own_thread_and_reports_when_polled() {
+    let d = temp("thread");
+    let path = d.join("x_ao.png");
+    let planned = Planned { path: path.clone(), bytes: png_with(&[1, 2], None) };
+    let (gate, wait) = std::sync::mpsc::channel::<()>();
+    let ctx = eframe::egui::Context::default();
+    let mut saving = Some(save::start(&ctx, vec![], say(), move || {
+        wait.recv().unwrap();
+        vec![(MapKind::Ao, planned)]
+    }));
+    let (mut review, mut status) = (None, None);
+    save::poll(&mut saving, &mut review, &mut status);
+    assert!(saving.is_some() && status.is_none() && !path.exists(), "the caller does not wait for the encode");
+    gate.send(()).unwrap();
+    finish(&mut saving, &mut review, &mut status);
+    assert_eq!(status, Some(Ok("1 written, 0 kept".into())));
+    assert!(review.is_none() && path.is_file());
+    fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn a_save_that_needs_a_choice_comes_back_as_a_review_with_nothing_written() {
+    let d = temp("ask");
+    let old = png_with(&[10, 20], None);
+    fs::write(d.join("x_ao.png"), &old).unwrap();
+    let plan = vec![
+        (MapKind::HeightData, Planned { path: d.join("x_height.png"), bytes: png_with(&[1, 2], None) }),
+        (MapKind::Ao, Planned { path: d.join("x_ao.png"), bytes: png_with(&[3, 4], None) }),
+    ];
+    let ctx = eframe::egui::Context::default();
+    let mut saving = Some(save::start(&ctx, vec![], say(), move || plan));
+    let (mut review, mut status) = (None, None);
+    finish(&mut saving, &mut review, &mut status);
+    assert!(status.is_none() && !d.join("x_height.png").exists());
+    let mut r = review.take().expect("the foreign file needs a choice");
+    assert!(matches!(r.rows[1].verdict, Verdict::Foreign));
+    // The dialog's Save, with Overwrite chosen.
+    r.rows[1].overwrite = true;
+    saving = Some(save::start_write(&ctx, r, vec![]));
+    finish(&mut saving, &mut review, &mut status);
+    assert_eq!(status, Some(Ok("2 written, 0 kept".into())));
+    assert_ne!(fs::read(d.join("x_ao.png")).unwrap(), old);
+    fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn closing_waits_for_a_running_save() {
+    let (gate, held) = std::sync::mpsc::channel::<()>();
+    let _saving = save::start(&eframe::egui::Context::default(), vec![], say(), move || {
+        let _ = held.recv();
+        vec![]
+    });
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = done.clone();
+    // What main does after the window has closed.
+    let waiter = std::thread::spawn(move || {
+        save::wait();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "the process would have ended in the middle of a save");
+    gate.send(()).unwrap();
+    waiter.join().unwrap();
+    assert!(done.load(std::sync::atomic::Ordering::SeqCst));
 }

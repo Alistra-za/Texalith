@@ -1,6 +1,8 @@
 //! RNM output names, the layer files found beside a base, and the bases RNM refuses.
 use super::{Kind, Layer};
+use crate::export::file_name;
 use crate::from_normal::files::{base_name, Source};
+use crate::from_normal::maps::Gray;
 use crate::marker::{encode_rgba16, MapKind, Marker, MAX_SIDE};
 use crate::tab::EXTENSIONS;
 use engine::image::Rgba32F;
@@ -15,18 +17,25 @@ pub struct Loaded {
     pub img: Arc<Rgba32F>,
 }
 
+/// A mask or an AO map put in a layer: where it came from and its red channel (`blend::red`).
+#[derive(Clone, Debug)]
+pub struct Plane {
+    pub source: Source,
+    pub img: Arc<Gray>,
+}
+
 /// One blended layer as the marker records it.
 pub struct Recorded<'a> {
     pub set: Layer,
-    pub file: &'a Loaded,
-    pub mask: Option<&'a Loaded>,
-    pub ao: Option<&'a Loaded>,
+    pub file: &'a Source,
+    pub mask: Option<&'a Source>,
+    pub ao: Option<&'a Source>,
 }
 
 /// The marked RGBA16 PNG of a blend. Its settings list `layers` in blend order; a layer's AO file is written only
 /// for a Bent layer with `use_ao` on, because the blend reads it only then.
 pub fn rnm_png(width: u32, height: u32, px: &[[f32; 4]], base: &Source, layers: &[Recorded]) -> Vec<u8> {
-    let file = |l: &Loaded| json!({ "path": l.source.path.to_string_lossy(), "sha256": l.source.sha256 });
+    let file = |s: &Source| json!({ "path": s.path.to_string_lossy(), "sha256": s.sha256 });
     let layers: Vec<Value> = layers
         .iter()
         .map(|l| {
@@ -60,10 +69,6 @@ pub fn rnm_png(width: u32, height: u32, px: &[[f32; 4]], base: &Source, layers: 
 
 fn file_stem(p: &Path) -> String {
     p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
-}
-
-fn file_name(p: &Path) -> String {
-    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// `stem` without a trailing `_cnr` (any case), when it has one and something before it.
@@ -200,18 +205,21 @@ pub fn siblings(base: &Path) -> Found {
     Found { layers, ao: take[10].take() }
 }
 
-/// Why RNM will not open `path` as a base, if it will not: a model-space `_msn` name, or a side above `MAX_SIDE`. A blend is one pass
-/// over the texels, so it goes to 8192 where the Material tab's solve stops at 4096.
+/// Why RNM will not read `path` at `size`, if it will not: a side above `MAX_SIDE`. A blend is one pass over the
+/// texels, so it goes to 8192 where the Material tab's solve stops at 4096; no layer, mask or AO map needs more.
+pub fn oversize(path: &Path, size: (u32, u32)) -> Option<String> {
+    (size.0 > MAX_SIDE || size.1 > MAX_SIDE).then(|| {
+        format!("{} is {}x{}; the largest RNM output is {MAX_SIDE}, so resize it first.", file_name(path), size.0, size.1)
+    })
+}
+
+/// Why RNM will not open `path` as a base, if it will not: a model-space `_msn` name, or `oversize`.
 pub fn refuse(path: &Path, size: (u32, u32)) -> Option<String> {
     let name = file_name(path);
-    let lower = file_stem(path).to_ascii_lowercase();
-    if lower.ends_with("_msn") {
-        Some(format!("{name} is a model-space normal (_msn); RNM blends tangent-space normals only."))
-    } else if size.0 > MAX_SIDE || size.1 > MAX_SIDE {
-        Some(format!("{name} is {}x{}; the largest RNM output is {MAX_SIDE}, so resize it first.", size.0, size.1))
-    } else {
-        None
+    if file_stem(path).to_ascii_lowercase().ends_with("_msn") {
+        return Some(format!("{name} is a model-space normal (_msn); RNM blends tangent-space normals only."));
     }
+    oversize(path, size)
 }
 
 #[cfg(test)]
@@ -294,9 +302,8 @@ mod tests {
         use crate::from_normal::files::Source;
         use crate::marker::{read, MapKind};
         let src = |p: &str, sha: &str| Source { path: PathBuf::from(p), sha256: sha.into() };
-        let loaded = |p: &str, sha: &str| Loaded { source: src(p, sha), img: Arc::new(Rgba32F::new(2, 2, [0.5; 4])) };
-        let (bump, mask) = (loaded("C:/t/rock_bump.png", "b1"), loaded("C:/t/rock_bump_mask.png", "m1"));
-        let (bent, ao) = (loaded("C:/t/rock_bent.png", "n1"), loaded("C:/t/rock_ao.png", "a1"));
+        let (bump, mask) = (src("C:/t/rock_bump.png", "b1"), src("C:/t/rock_bump_mask.png", "m1"));
+        let (bent, ao) = (src("C:/t/rock_bent.png", "n1"), src("C:/t/rock_ao.png", "a1"));
         let off = Layer { use_ao: false, ..Layer::new(Kind::Bent) };
         let layers = [
             Recorded { set: Layer::new(Kind::Bump), file: &bump, mask: Some(&mask), ao: None },

@@ -274,6 +274,18 @@ mod tests {
     }
 
     #[test]
+    fn a_sun_at_the_loaders_cap_stays_white_through_every_tone_step() {
+        // What `open::finite` makes of an infinite texel, at the hardest settings for it.
+        let sun = crate::cube::open::SUN;
+        let s = Settings { brightness: 4.0, rolloff: Some(0.5), colour: 0.5, tint: [200, 255, 255], ..settings() };
+        let mut c = flat([sun, sun, sun]);
+        tone(&mut c, &s);
+        let p = c.faces[0].px[0];
+        assert!(p[..3].iter().all(|v| v.is_finite()), "{p:?}");
+        assert!(p[1] > 0.99 && p[1] <= 1.0 + 1e-5, "{p:?}");
+    }
+
+    #[test]
     fn colour_strength_zero_is_grey_and_stays_positive() {
         let mut c = flat([0.8, 0.2, 0.1]);
         tone(&mut c, &Settings { colour: 0.0, ..settings() });

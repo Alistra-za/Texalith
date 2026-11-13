@@ -56,8 +56,6 @@ pub struct App {
     sent: Option<View>,
     last_camera: Option<[f32; 3]>,
     moved_at: Option<f64>,
-    /// [`MOVING_PIXELS`]; a timing run can lift it.
-    pub moving_pixels: f32,
     in_flight: bool,
     texture: Option<egui::TextureHandle>,
     /// Build name and short fingerprint, shown so a preview can be tied to its shaders.
@@ -65,15 +63,9 @@ pub struct App {
     adapter: Option<(String, bool)>,
     pub error: Option<String>,
     pub cost: FrameCost,
-    /// Frames put on screen and frames asked for, counted for the timing run and tests.
+    /// Frames put on screen and frames asked for, counted for tests.
     pub shown: u64,
     pub asked: u64,
-    /// Device recoveries and the last one's duration.
-    pub recoveries: u64,
-    pub recovery_ms: f64,
-    /// When set, a copy of the last frame, so a run can compare frames. Off in normal use.
-    pub keep_pixels: bool,
-    pub last_pixels: Option<egui::ColorImage>,
     /// This process is a restart after a lost graphics device: say so, or the window just blinked for no reason.
     pub restarted: bool,
     pub tab: Tab,
@@ -119,7 +111,6 @@ impl App {
             sent: None,
             last_camera: None,
             moved_at: None,
-            moving_pixels: MOVING_PIXELS,
             in_flight: false,
             texture: None,
             shaders_label,
@@ -128,10 +119,6 @@ impl App {
             cost: FrameCost::default(),
             shown: 0,
             asked: 0,
-            recoveries: 0,
-            recovery_ms: 0.0,
-            keep_pixels: false,
-            last_pixels: None,
             restarted: false,
             tab,
             rnm,
@@ -204,20 +191,6 @@ impl App {
         let _ = self.tx.send(cmd);
     }
 
-    /// For work that finishes off the UI thread and then sends its result.
-    pub fn sender(&self) -> Sender<Cmd> {
-        self.tx.clone()
-    }
-
-    pub fn adapter(&self) -> Option<&str> {
-        self.adapter.as_ref().map(|a| a.0.as_str())
-    }
-
-    /// Size of the frame last asked for, in pixels.
-    pub fn last_view_label(&self) -> String {
-        self.sent.map_or(String::new(), |v| format!("{}x{}", v.w, v.h))
-    }
-
     fn show_frame(&mut self, ctx: &egui::Context, f: Frame) {
         self.in_flight = false;
         self.error = None;
@@ -226,9 +199,6 @@ impl App {
             render_ms: f.render_ms,
             latency_ms: f.asked.elapsed().as_secs_f64() * 1e3,
         };
-        if self.keep_pixels {
-            self.last_pixels = Some(f.image.clone());
-        }
         match &mut self.texture {
             Some(t) => t.set(f.image, egui::TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("preview", f.image, egui::TextureOptions::LINEAR)),
@@ -246,11 +216,7 @@ impl App {
                     self.shaders_label = format!("{} ({short})", self.shaders_label);
                 }
                 Ok(Reply::Frame(f)) => newest = Some(f),
-                Ok(Reply::Recovered { adapter, warp, ms }) => {
-                    self.adapter = Some((adapter, warp));
-                    self.recoveries += 1;
-                    self.recovery_ms = ms;
-                }
+                Ok(Reply::Recovered { adapter, warp, .. }) => self.adapter = Some((adapter, warp)),
                 Ok(Reply::Failed(e)) => {
                     self.in_flight = false;
                     self.error = Some(e);
@@ -275,7 +241,14 @@ impl App {
         if cube {
             self.cube_texture = None;
         }
-        if (from_normal && self.mode == Mode::FromNormal) || (rnm && self.mode == Mode::Rnm) || (cube && self.mode == Mode::Cube) {
+        // Another file was opened and its first result is not here yet: the last file's maps are not its preview.
+        let has_outputs = match self.mode {
+            Mode::FromNormal => self.tab.outputs.is_some(),
+            Mode::Rnm => self.rnm.outputs.is_some(),
+            Mode::Cube => self.cube.outputs.is_some(),
+        };
+        let cleared = !has_outputs && self.slots.as_ref().is_some_and(|m| !m.is_empty());
+        if cleared || (from_normal && self.mode == Mode::FromNormal) || (rnm && self.mode == Mode::Rnm) || (cube && self.mode == Mode::Cube) {
             self.textures.clear();
             self.push_maps();
         }
@@ -292,10 +265,21 @@ impl App {
                     ui.selectable_value(&mut self.mode, Mode::Rnm, "RNM");
                     ui.selectable_value(&mut self.mode, Mode::Cube, "Cubemap");
                 });
+                // A file open in one tab is kept by every tab's Save.
+                let (m, r, c) = (self.tab.open_files(), self.rnm.open_files(), self.cube.open_files());
                 match before {
-                    Mode::FromNormal => self.tab.draw_column(ui),
-                    Mode::Rnm => self.rnm.draw_column(ui),
-                    Mode::Cube => self.cube.draw_column(ui),
+                    Mode::FromNormal => {
+                        self.tab.elsewhere = [r, c].concat();
+                        self.tab.draw_column(ui)
+                    }
+                    Mode::Rnm => {
+                        self.rnm.elsewhere = [m, c].concat();
+                        self.rnm.draw_column(ui)
+                    }
+                    Mode::Cube => {
+                        self.cube.elsewhere = [m, r].concat();
+                        self.cube.draw_column(ui)
+                    }
                 }
             });
         if self.mode != before {
@@ -509,7 +493,7 @@ impl App {
         if moving {
             ctx.request_repaint_after_secs(REST_SECONDS as f32);
         }
-        let scale = if moving { (self.moving_pixels / (w * h).max(1.0)).sqrt().min(1.0) } else { 1.0 };
+        let scale = if moving { (MOVING_PIXELS / (w * h).max(1.0)).sqrt().min(1.0) } else { 1.0 };
         let view = View {
             yaw: self.yaw,
             pitch: self.pitch,

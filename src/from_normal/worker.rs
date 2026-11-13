@@ -1,10 +1,10 @@
 //! Generation off the UI thread, in the pattern of `crate::preview`: the tab sends a `Job`, the thread keeps only the
 //! newest one queued, and answers with its outputs. The master and every output are cached by their own options, so
-//! an output's own slider never re-solves.
+//! an output's own slider never re-solves. Drafts above `DRAFT_SIZE` have a cache of their own.
 use super::input::Kind;
 use super::maps::{
-    ao, cavity, curvature, height_data, match_depth, normal_from_height, parallax, AoSettings, CurvatureOpts, Gray,
-    ParallaxOpts, ParallaxReport,
+    ao, cavity, curvature, darken, height_data, match_depth, normal_from_height, parallax, AoSettings, CurvatureOpts,
+    Gray, ParallaxOpts, ParallaxReport,
 };
 use super::master::{build, BuildError, Green, Master, MasterOpts, MasterReport};
 use super::settings::{Settings, Ticks};
@@ -62,13 +62,9 @@ pub enum Reply {
 
 type Slot<K, V> = Option<(K, V)>;
 
-/// What the worker keeps between jobs. `gen` names the cached master; every output key starts with it.
+/// One master and the outputs made from it. `gen` names the master; every output key starts with it.
 #[derive(Default)]
-pub struct Cache {
-    pub master_builds: u32,
-    pub ao_runs: u32,
-    img: Option<Arc<Rgba32F>>,
-    img_gen: u64,
+struct Kept {
     master: Slot<(Kind, MasterOpts), Arc<Master>>,
     gen: u64,
     height: Slot<u64, (Gray, f64)>,
@@ -76,9 +72,22 @@ pub struct Cache {
     preview_normal: Slot<u64, Vec<[f32; 4]>>,
     parallax: Slot<(u64, ParallaxOpts), (Gray, ParallaxReport)>,
     normal: Slot<(u64, Green), Vec<[f32; 4]>>,
-    ao: Slot<(u64, AoSettings), Gray>,
+    /// AO at strength 1, by reach and surface depth: the strength is a power applied to it per job.
+    ao: Slot<(u64, u32, u32), Gray>,
     cavity: Slot<(u64, u32, u32), Gray>,
     curvature: Slot<(u64, CurvatureOpts), Gray>,
+}
+
+/// What the worker keeps between jobs: the full-size maps, and those of a draft that ran below the chosen size, so
+/// a drag that sends drafts does not cost the full master.
+#[derive(Default)]
+pub struct Cache {
+    pub master_builds: u32,
+    pub ao_runs: u32,
+    img: Option<Arc<Rgba32F>>,
+    img_gen: u64,
+    full: Kept,
+    draft: Kept,
     compare: Slot<(u64, Kind, MasterOpts), [Gray; 3]>,
 }
 
@@ -102,54 +111,56 @@ pub fn compute(cache: &mut Cache, job: &Job) -> Result<Option<Outputs>, String> 
     if !cache.img.as_ref().is_some_and(|i| Arc::ptr_eq(i, &job.img)) {
         cache.img = Some(job.img.clone());
         cache.img_gen += 1;
-        cache.master = None;
+        (cache.full.master, cache.draft.master) = (None, None);
     }
     let mut mo = s.master.clone();
-    if job.draft {
-        mo.size = mo.size.min(DRAFT_SIZE);
+    let small = job.draft && mo.size > DRAFT_SIZE;
+    if small {
+        mo.size = DRAFT_SIZE;
     }
     let kind = Settings::job_kind(&job.kind);
     let key = (kind.clone(), mo.clone());
-    if !matches!(&cache.master, Some((k, _)) if *k == key) {
+    let kept = if small { &mut cache.draft } else { &mut cache.full };
+    if !matches!(&kept.master, Some((k, _)) if *k == key) {
         let m = match build(&job.img, &kind, &mo, cancel) {
             Ok(m) => m,
             Err(BuildError::Cancelled) => return Ok(None),
             Err(e) => return Err(e.to_string()),
         };
         cache.master_builds += 1;
-        cache.gen += 1;
-        cache.master = Some((key, Arc::new(m)));
+        kept.gen += 1;
+        kept.master = Some((key, Arc::new(m)));
     }
-    let m = cache.master.as_ref().expect("built above").1.clone();
-    let gen = cache.gen;
+    let m = kept.master.as_ref().expect("built above").1.clone();
+    let gen = kept.gen;
 
-    let height = cached(&mut cache.height, gen, || Some(height_data(&m))).expect("never cancelled");
-    let match_depth = cached(&mut cache.match_depth, gen, || Some(match_depth(&m))).expect("never cancelled");
-    let preview_normal = cached(&mut cache.preview_normal, gen, || Some(preview_normal(&job.img, &m)))
+    let height = cached(&mut kept.height, gen, || Some(height_data(&m))).expect("never cancelled");
+    let match_depth = cached(&mut kept.match_depth, gen, || Some(match_depth(&m))).expect("never cancelled");
+    let preview_normal = cached(&mut kept.preview_normal, gen, || Some(preview_normal(&job.img, &m)))
         .expect("never cancelled");
     let t: Ticks = s.ticks;
-    let parallax = t.parallax.then(|| cached(&mut cache.parallax, (gen, s.parallax.clone()), || Some(parallax(&m, &s.parallax))));
-    let normal = t.normal.then(|| cached(&mut cache.normal, (gen, s.normal_green), || Some(normal_from_height(&m, s.normal_green))));
-    let curvature = t.curvature.then(|| cached(&mut cache.curvature, (gen, s.curvature), || Some(curvature(&m, &s.curvature))));
+    let parallax = t.parallax.then(|| cached(&mut kept.parallax, (gen, s.parallax.clone()), || Some(parallax(&m, &s.parallax))));
+    let normal = t.normal.then(|| cached(&mut kept.normal, (gen, s.normal_green), || Some(normal_from_height(&m, s.normal_green))));
+    let curvature = t.curvature.then(|| cached(&mut kept.curvature, (gen, s.curvature), || Some(curvature(&m, &s.curvature))));
     if cancelled() {
         return Ok(None);
     }
     let long = m.width.max(m.height);
     let ao_runs = &mut cache.ao_runs;
+    let depth = s.ao.surface_depth;
     let ao = match t.ao {
-        true => match cached(&mut cache.ao, (gen, s.ao), || {
+        true => match cached(&mut kept.ao, (gen, s.ao.reach.to_bits(), depth.to_bits()), || {
             *ao_runs += 1;
-            ao(&m, &s.ao, long, &job.progress, cancel)
+            ao(&m, &AoSettings { darkness: 1.0, ..s.ao }, long, &job.progress, cancel)
         }) {
             None => return Ok(None),
-            v => Some(v),
+            Some(v) => Some(Some(darken(v, s.ao.darkness))),
         },
         false => None,
     };
     let crevice = s.crevice_at(m.width);
-    let depth = s.ao.surface_depth;
     let cavity = match t.cavity {
-        true => match cached(&mut cache.cavity, (gen, crevice.to_bits(), depth.to_bits()), || {
+        true => match cached(&mut kept.cavity, (gen, crevice.to_bits(), depth.to_bits()), || {
             cavity(&m, crevice, depth, &job.progress, cancel)
         }) {
             None => return Ok(None),
@@ -192,10 +203,10 @@ fn preview_normal(img: &Rgba32F, m: &Master) -> Vec<[f32; 4]> {
         return normal_from_height(m, Green::Directx);
     }
     let flip = m.report.green == Green::Opengl;
-    resample(img.clone(), (m.width, m.height))
+    resample(img, (m.width, m.height))
         .px
-        .into_iter()
-        .map(|p| if flip { [p[0], 1.0 - p[1], p[2], p[3]] } else { p })
+        .iter()
+        .map(|p| if flip { [p[0], 1.0 - p[1], p[2], p[3]] } else { *p })
         .collect()
 }
 
@@ -295,6 +306,49 @@ mod tests {
         s.master.flatten = 0.8;
         run(&mut c, &normal_job(&img, s));
         assert_eq!((c.master_builds, c.ao_runs), (2, 2));
+    }
+
+    #[test]
+    fn ao_strength_reuses_the_ao_pass() {
+        let img = Arc::new(bump_normal(64));
+        let mut c = Cache::default();
+        // Deep and far-reaching, so the bump's foot is shaded.
+        let mut s = base(64);
+        (s.ao.reach, s.ao.surface_depth) = (0.25, 4.0);
+        let a = run(&mut c, &normal_job(&img, s.clone())).ao.unwrap();
+        let low = a.px.iter().fold(1.0f32, |m, v| m.min(*v));
+        assert!(low < 0.99, "the test needs some shade: {low}");
+        s.ao.darkness = 2.0;
+        let b = run(&mut c, &normal_job(&img, s.clone())).ao.unwrap();
+        assert_eq!((c.master_builds, c.ao_runs), (1, 1), "the strength is a power on the kept AO");
+        // The same values as a pass made with that strength.
+        let m = build(&img, &Kind::Normal, &s.master, &no()).unwrap();
+        let want = ao(&m, &s.ao, 64, &AtomicU32::new(0), &no()).unwrap();
+        assert!(b.px.iter().zip(&want.px).all(|(x, y)| (x - y).abs() < 1e-6));
+        assert_ne!(a.px, b.px);
+        // Reach is part of the pass.
+        s.ao.reach = 0.125;
+        run(&mut c, &normal_job(&img, s));
+        assert_eq!((c.master_builds, c.ao_runs), (1, 2));
+    }
+
+    #[test]
+    fn a_draft_above_1024_keeps_the_full_master() {
+        let img = Arc::new(bump_normal(2048));
+        let mut s = base(2048);
+        s.ticks = Ticks { height: true, parallax: false, normal: false, ao: false, curvature: false, cavity: false };
+        s.master.size = 2048;
+        let mut c = Cache::default();
+        run(&mut c, &normal_job(&img, s.clone()));
+        // A Reach or Surface depth drag: drafts with the same master options.
+        let mut j = normal_job(&img, s.clone());
+        j.draft = true;
+        assert_eq!(run(&mut c, &j).size, (1024, 1024));
+        assert_eq!(run(&mut c, &j).size, (1024, 1024));
+        assert_eq!(c.master_builds, 2, "one full master and one draft");
+        // Letting go: the full master is still there.
+        assert_eq!(run(&mut c, &normal_job(&img, s)).size, (2048, 2048));
+        assert_eq!(c.master_builds, 2);
     }
 
     #[test]

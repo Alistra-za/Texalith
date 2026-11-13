@@ -96,7 +96,7 @@ fn check(use_ao: bool) {
     let layer = |kind, strength, flip, img: &PathBuf, mask: Option<&PathBuf>| Input {
         set: Layer { strength, flip, use_ao, ao_power: 2.5, ..Layer::new(kind) },
         img: load(img),
-        mask: mask.map(|m| load(m)),
+        mask: mask.map(|m| Arc::new(blend::red(&load(m)))),
         ao: None,
     };
     // Tessalith's order for this job: detail, bent, bump2, detail2, bump.
@@ -107,7 +107,7 @@ fn check(use_ao: bool) {
         layer(Kind::Detail, 0.45, false, &detail2, None),
         layer(Kind::Bump, 0.7, false, &bump, Some(&bump_mask)),
     ];
-    layers[1].ao = Some((load(&ao), 0));
+    layers[1].ao = Some(Arc::new(blend::red(&load(&ao))));
     let mut ours = work.clone();
     blend::apply(&mut ours, &layers);
 

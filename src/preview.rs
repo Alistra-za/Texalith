@@ -154,6 +154,9 @@ pub fn spawn(shaders: PathBuf, settings: render3d::cs_settings::CsSettings, cach
     (cmd_tx, reply_rx)
 }
 
+/// Shown when the shader folder is not there: the usual cause is an exe moved or unzipped without its folders.
+pub const MISSING_SHADERS: &str = "The cs-shaders folder is missing beside texalith.exe. Unzip the release again and keep its folders together.";
+
 fn run(
     rx: &Receiver<Cmd>,
     send: &dyn Fn(Reply),
@@ -161,6 +164,9 @@ fn run(
     settings: render3d::cs_settings::CsSettings,
     cache: PathBuf,
 ) -> Result<(), String> {
+    if !shaders.is_dir() {
+        return Err(MISSING_SHADERS.into());
+    }
     let fp = render3d::locate::fingerprint(&shaders, None).map_err(|e| e.to_string())?;
     let fingerprint = fp.hash.clone();
     let mut r = Renderer::new(fp, cache)?;
@@ -283,6 +289,17 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_shader_folder_says_what_to_do() {
+        let gone = std::env::temp_dir().join(format!("texalith-no-shaders-{}", std::process::id()));
+        let settings = crate::bundle::settings(&gone);
+        let (_tx, rx) = spawn(gone.join("shaders"), settings, gone.join("cache"), egui::Context::default());
+        match rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a reply") {
+            Reply::Failed(e) => assert_eq!(e, MISSING_SHADERS),
+            _ => panic!("the preview started without its shaders"),
+        }
+    }
 
     #[test]
     fn a_white_parallax_map_draws_as_two_layers() {

@@ -27,7 +27,7 @@ pub struct Output {
 pub fn compute(job: &Job) -> Output {
     let mut work = (*job.base).clone();
     apply(&mut work, &job.layers);
-    Output { id: job.id, size: (work.width, work.height), px: encode(&work), preview: None }
+    Output { id: job.id, size: (work.width, work.height), px: encode(work), preview: None }
 }
 
 /// `compute` with the preview's maps packed: what the blend thread sends, so the UI thread packs nothing.
@@ -88,7 +88,7 @@ mod tests {
         let o = compute(&j);
         assert_eq!((o.id, o.size), (7, (8, 4)));
         assert!(o.px.iter().zip(&j.base.px).all(|(a, b)| a[3] == b[3]));
-        assert!(o.px.iter().zip(encode(&j.base)).any(|(a, b)| a[..3] != b[..3]), "the detail must change something");
+        assert!(o.px.iter().zip(encode((*j.base).clone())).any(|(a, b)| a[..3] != b[..3]), "the detail must change something");
     }
 
     #[test]
@@ -104,7 +104,7 @@ mod tests {
     fn no_layers_gives_the_base_back() {
         let j = job(1, vec![]);
         let o = compute(&j);
-        for (a, b) in o.px.iter().zip(encode(&j.base)) {
+        for (a, b) in o.px.iter().zip(encode((*j.base).clone())) {
             for c in 0..4 {
                 assert!((a[c] - b[c]).abs() < 1e-6, "{a:?} vs {b:?}");
             }
@@ -120,7 +120,9 @@ mod tests {
             let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(10));
         });
         tx.send(job(1, detail())).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).expect("output 1").id, 1);
+        let first = rx.recv_timeout(Duration::from_secs(10)).expect("output 1");
+        assert_eq!(first.id, 1);
+        assert!(first.preview.is_some(), "the thread packs the preview's maps, so the window's thread does not");
         tx.send(job(2, detail())).unwrap();
         tx.send(job(3, detail())).unwrap();
         drop(gate_tx);

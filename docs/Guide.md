@@ -35,7 +35,7 @@ The AO is estimated from the normal, not baked from a mesh. If you have a real h
 
 ## Blend normal layers (RNM tab)
 
-1. Click **Open base…** and pick the base normal (`_n` or `_cnr`). Model-space normals (`_msn`) are refused. The base can be up to 8192 on a side: the blend is saved at the base's size, the 3D preview shows an 8192 blend at 4096, and each open 8192 image takes about 1 GB of memory. Layer files beside the base whose names end in `_bump`, `_detail`, `_detailnorm` or `_bent` (also with `2`, and with `mask` for masks) are added as layers.
+1. Click **Open base…** and pick the base normal (`_n` or `_cnr`). Model-space normals (`_msn`) are refused. The base can be up to 8192 on a side: the blend is saved at the base's size, the 3D preview and the 2D view show an 8192 blend at 4096, and an open 8192 base or layer takes about 1 GB of memory (a mask or AO map about 270 MB). A layer, mask or AO map over 8192 on a side is refused: resize it first. Layer files beside the base whose names end in `_bump`, `_detail`, `_detailnorm` or `_bent` (also with `2`, and with `mask` for masks) are added as layers.
 2. Click **Add layer** for each further layer, and choose its file.
 3. Set each layer's strength. Reorder with the drag handle or the arrows: layers blend from the top down, so each layer sits over the ones above it.
 4. Pick a folder under **Save to** and click **Save**. The button's hover text shows the file name.
@@ -74,7 +74,7 @@ The base's alpha is kept as it is. The output takes the base's name; saved into 
 | **Ground**, **Horizon line** | The bottom of the source shows a tripod, a blank area or the wrong floor. |
 | **Fix one side**, **Turn this face**, **Flip this face**, **Turn bottom cell** | One face of a cross, strip or face set is rotated or mirrored against its neighbours. |
 
-A source larger than 8192 px on a side is halved until it fits.
+A source larger than 8192 px on a side is halved until it fits. A panorama, angular map or photo far larger than the cube is averaged down to it first, so a small sun keeps its light at every **Side size**.
 
 ## Check the result (the centre view and the Preview panel)
 
@@ -88,8 +88,9 @@ A source larger than 8192 px on a side is halved until it fits.
 ## Saving
 
 - Files are 16-bit PNGs. Each one records Texalith's version, the source's path and hash, and the settings, in a text chunk.
+- Save runs in the background. **Save** is off and "Saving…" shows until the files are written; an 8192 blend takes a few seconds. Close the window during a save and Texalith finishes the save before it exits.
 - A file Texalith made and nobody changed is replaced without asking.
 - Any other file with the same name opens **Some files will be kept**. Choose **Keep** or **Overwrite** per file; **Keep a backup in _sdc\texalith-backup** copies an overwritten file into that folder, beside the output, first.
-- The file you opened is always kept.
+- A file open in any tab is always kept, also when you save from another tab.
 
 Next: encode the saved PNGs to DDS with [Tessalith](https://github.com/Alistra-za/Tessalith).

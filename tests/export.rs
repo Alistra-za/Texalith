@@ -2,7 +2,7 @@
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
-use texalith::export::{check, write, Planned, Verdict};
+use texalith::export::{check, write, write_or_ask, Planned, Unasked, Verdict};
 use texalith::from_normal::files::{self, Source};
 use texalith::from_normal::maps::Gray;
 use texalith::marker::{self, MapKind};
@@ -67,15 +67,15 @@ fn the_check_follows_the_marker_rule() {
     let d = temp("check");
     let ours = marked();
     let p = |name: &str| d.join(name);
-    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: ours.clone() }, &none()), Verdict::New));
+    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: ours.clone() }, &[none()]), Verdict::New));
     fs::write(p("a_ao.png"), &ours).unwrap();
-    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: ours.clone() }, &none()), Verdict::Same));
+    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: ours.clone() }, &[none()]), Verdict::Same));
     let newer = marked_other();
-    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: newer.clone() }, &none()), Verdict::Ours));
+    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: newer.clone() }, &[none()]), Verdict::Ours));
     fs::write(p("a_ao.png"), edited_keeping_marker(&ours)).unwrap();
-    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: newer.clone() }, &none()), Verdict::Foreign));
+    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: newer.clone() }, &[none()]), Verdict::Foreign));
     fs::write(p("a_ao.png"), plain_png()).unwrap();
-    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: newer }, &none()), Verdict::Foreign));
+    assert!(matches!(check(&Planned { path: p("a_ao.png"), bytes: newer }, &[none()]), Verdict::Foreign));
     fs::remove_dir_all(&d).unwrap();
 }
 
@@ -84,13 +84,13 @@ fn foreign_is_kept_unless_asked_and_backed_up_when_overwritten() {
     let d = temp("keep");
     fs::write(d.join("a_n.png"), plain_png()).unwrap();
     let plan = [Planned { path: d.join("a_n.png"), bytes: marked() }];
-    assert!(write(&plan, &none(), &[false], true).unwrap().is_empty());
+    assert!(write(&plan, &[none()], &[false], true).unwrap().is_empty());
     assert_eq!(fs::read(d.join("a_n.png")).unwrap(), plain_png());
-    assert_eq!(write(&plan, &none(), &[true], true).unwrap(), vec![d.join("a_n.png")]);
+    assert_eq!(write(&plan, &[none()], &[true], true).unwrap(), vec![d.join("a_n.png")]);
     assert_eq!(fs::read(d.join("a_n.png")).unwrap(), marked());
     assert_eq!(fs::read(d.join("_sdc/texalith-backup/a_n.png")).unwrap(), plain_png());
     // Written again with the same bytes: Same, skipped.
-    assert!(write(&plan, &none(), &[true], true).unwrap().is_empty());
+    assert!(write(&plan, &[none()], &[true], true).unwrap().is_empty());
     fs::remove_dir_all(&d).unwrap();
 }
 
@@ -102,8 +102,8 @@ fn the_opened_file_is_never_written_even_when_ours() {
     fs::write(&opened, marked()).unwrap();
     for spelled in [opened.clone(), d.join("BARK_HEIGHT.PNG")] {
         let plan = [Planned { path: spelled, bytes: marked_other() }];
-        assert!(matches!(check(&plan[0], &opened), Verdict::Source));
-        assert!(write(&plan, &opened, &[true], true).unwrap().is_empty());
+        assert!(matches!(check(&plan[0], std::slice::from_ref(&opened)), Verdict::Source));
+        assert!(write(&plan, std::slice::from_ref(&opened), &[true], true).unwrap().is_empty());
     }
     assert_eq!(fs::read(&opened).unwrap(), marked());
     fs::remove_dir_all(&d).unwrap();
@@ -115,16 +115,16 @@ fn a_second_backup_of_one_name_keeps_the_first() {
     let d = temp("backup2");
     let plan = [Planned { path: d.join("a_ao.png"), bytes: marked() }];
     fs::write(d.join("a_ao.png"), plain_png()).unwrap();
-    write(&plan, &none(), &[true], true).unwrap();
+    write(&plan, &[none()], &[true], true).unwrap();
     let second = png_with(&[3, 4], None);
     fs::write(d.join("a_ao.png"), &second).unwrap();
-    write(&plan, &none(), &[true], true).unwrap();
+    write(&plan, &[none()], &[true], true).unwrap();
     let b = d.join("_sdc/texalith-backup");
     assert_eq!(fs::read(b.join("a_ao.png")).unwrap(), plain_png());
     assert_eq!(fs::read(b.join("a_ao-2.png")).unwrap(), second);
     // The same foreign bytes again reuse their backup instead of piling up copies.
     fs::write(d.join("a_ao.png"), &second).unwrap();
-    write(&plan, &none(), &[true], true).unwrap();
+    write(&plan, &[none()], &[true], true).unwrap();
     assert!(!b.join("a_ao-3.png").exists());
     fs::remove_dir_all(&d).unwrap();
 }
@@ -134,8 +134,8 @@ fn an_unreadable_target_is_always_kept() {
     let d = temp("unreadable");
     fs::create_dir(d.join("a_ao.png")).unwrap(); // reading a directory fails with something other than NotFound
     let plan = [Planned { path: d.join("a_ao.png"), bytes: marked() }];
-    assert!(matches!(check(&plan[0], &none()), Verdict::Unreadable(_)));
-    assert!(write(&plan, &none(), &[true], true).unwrap().is_empty());
+    assert!(matches!(check(&plan[0], &[none()]), Verdict::Unreadable(_)));
+    assert!(write(&plan, &[none()], &[true], true).unwrap().is_empty());
     assert!(d.join("a_ao.png").is_dir());
     fs::remove_dir_all(&d).unwrap();
 }
@@ -151,10 +151,30 @@ fn a_failed_write_rolls_back_the_files_before_it() {
         Planned { path: d.join("a_curvature.png"), bytes: marked() },
         Planned { path: d.join("blocker").join("a_cavity.png"), bytes: marked() },
     ];
-    assert!(matches!(check(&plan[2], &none()), Verdict::New));
-    let err = write(&plan, &none(), &[false; 3], false).unwrap_err();
+    assert!(matches!(check(&plan[2], &[none()]), Verdict::New));
+    let err = write(&plan, &[none()], &[false; 3], false).unwrap_err();
     assert!(err.contains("a_cavity.png"), "{err}");
     assert_eq!(fs::read(d.join("a_ao.png")).unwrap(), marked());
     assert!(!d.join("a_curvature.png").exists());
+    fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn an_unasked_write_stops_for_a_question_before_it_writes_anything() {
+    let d = temp("unasked");
+    let plan = [Planned { path: d.join("a_h.png"), bytes: marked() }, Planned { path: d.join("a_ao.png"), bytes: marked_other() }];
+    // A new file and one of Texalith's own: written at once.
+    fs::write(d.join("a_ao.png"), marked()).unwrap();
+    assert!(matches!(write_or_ask(&plan, &[none()]).unwrap(), Unasked::Written(w) if w.len() == 2));
+    assert_eq!(fs::read(d.join("a_ao.png")).unwrap(), marked_other());
+    // A foreign file: nothing is written, the new file included.
+    fs::remove_file(d.join("a_h.png")).unwrap();
+    fs::write(d.join("a_ao.png"), plain_png()).unwrap();
+    match write_or_ask(&plan, &[none()]).unwrap() {
+        Unasked::Ask(v) => assert!(matches!(v[..], [Verdict::New, Verdict::Foreign]), "{v:?}"),
+        Unasked::Written(w) => panic!("wrote {w:?}"),
+    }
+    assert!(!d.join("a_h.png").exists());
+    assert_eq!(fs::read(d.join("a_ao.png")).unwrap(), plain_png());
     fs::remove_dir_all(&d).unwrap();
 }

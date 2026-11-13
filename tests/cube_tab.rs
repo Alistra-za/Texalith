@@ -78,6 +78,28 @@ fn pick(h: &mut Harness<'_, CubeTab>, name: &str) {
     h.run_steps(3);
 }
 
+/// Steps until the running save has finished and its result is shown.
+fn saved(h: &mut Harness<'_, CubeTab>) {
+    let start = std::time::Instant::now();
+    while h.state().saving.is_some() {
+        assert!(start.elapsed().as_secs() < 300, "the save never finished");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+}
+
+/// A save that waits for the returned sender, then has nothing to write.
+fn held_save(ctx: &egui::Context) -> (std::sync::mpsc::Sender<()>, texalith::save::Saving) {
+    let (gate, wait) = std::sync::mpsc::channel();
+    let say = Box::new(|w, k| format!("{w} written, {k} kept"));
+    let s = texalith::save::start(ctx, vec![], say, move || {
+        let _ = wait.recv();
+        vec![]
+    });
+    (gate, s)
+}
+
 fn save_disabled(h: &Harness<'_, CubeTab>) -> bool {
     h.get_by_role_and_label(Role::Button, "Save").accesskit_node().is_disabled()
 }
@@ -231,6 +253,7 @@ fn save_writes_one_marked_strip() {
     settle(&mut h);
     h.get_by_role_and_label(Role::Button, "Save").click_accesskit();
     h.run_steps(2);
+    saved(&mut h);
     let bytes = std::fs::read(out.join("pano_e.png")).expect("the output was written");
     let r = png::Decoder::new(std::io::Cursor::new(&bytes)).read_info().unwrap();
     assert_eq!((r.info().width, r.info().height), (96, 16));
@@ -356,7 +379,188 @@ fn a_strip_saved_beside_itself_gets_a_1() {
     assert!(!save_disabled(&h));
     h.get_by_role_and_label(Role::Button, "Save").click_accesskit();
     h.run_steps(2);
+    saved(&mut h);
     let bytes = std::fs::read(d.join("sky_e1.png")).expect("the output was written");
     assert_eq!(marker::read(&bytes).unwrap().kind, MapKind::Cube);
     assert_eq!(std::fs::read(&p).unwrap(), before);
+}
+
+#[test]
+fn a_value_that_comes_back_after_its_result_was_dropped_is_sent_again() {
+    let d = temp("back");
+    let p = png(&d, "pano.png", 64, 32);
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
+    let (_out_tx, out_rx) = std::sync::mpsc::channel();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+        |ui, tab: &mut CubeTab| {
+            tab.drain();
+            egui::Panel::left("column").resizable(false).exact_size(COLUMN_WIDTH).show(ui, |ui| tab.draw_column(ui));
+        },
+        CubeTab::new(job_tx, out_rx),
+    );
+    let ctx = h.ctx.clone();
+    h.state_mut().open(p, &ctx);
+    for _ in 0..500 {
+        h.run_steps(1);
+        if !h.state().busy() && h.state().jobs_sent > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.run_steps(2);
+    let running = h.state().jobs_sent;
+    assert!(running > 0 && job_rx.try_iter().count() > 0, "a job is out and has no result yet");
+    // The button is held (on nothing), so a changed value waits and the running job's result is dropped.
+    let held = egui::pos2(900.0, 450.0);
+    h.drag_at(held);
+    h.step();
+    h.state_mut().settings.brightness = 1.0;
+    h.run_steps(2);
+    h.state_mut().settings.brightness = 0.0;
+    h.step();
+    h.drop_at(held);
+    h.run_steps(2);
+    assert_eq!(h.state().jobs_sent, running + 1, "the dropped result's value is sent again");
+}
+
+#[test]
+fn save_is_off_while_a_save_runs() {
+    let d = temp("saving");
+    let mut h = rig();
+    open(&mut h, &png(&d, "pano.png", 64, 32));
+    settle(&mut h);
+    assert!(!save_disabled(&h));
+    let (gate, saving) = held_save(&h.ctx);
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    assert!(save_disabled(&h) && shown(&h, "Saving…"));
+    // A new source while it runs: the save still answers, and Save stays off until it has.
+    open(&mut h, &png(&d, "other.png", 64, 32));
+    settle(&mut h);
+    assert!(h.state().saving.is_some() && save_disabled(&h));
+    gate.send(()).unwrap();
+    saved(&mut h);
+    assert_eq!(h.state().status, Some(Ok("0 written, 0 kept".into())));
+    assert!(!save_disabled(&h));
+}
+
+#[test]
+fn a_name_open_in_another_tab_is_passed_over() {
+    let d = temp("elsewhere-name");
+    let mut h = rig();
+    open(&mut h, &png(&d, "pano.png", 64, 32));
+    settle(&mut h);
+    // pano_e.png is open in another tab.
+    let other = png(&d, "pano_e.png", 48, 8);
+    let before = std::fs::read(&other).unwrap();
+    h.state_mut().elsewhere = vec![other.clone()];
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::Button, "Save").click_accesskit();
+    h.run_steps(2);
+    saved(&mut h);
+    assert!(d.join("pano_e1.png").is_file(), "status {:?}", h.state().status);
+    assert_eq!(std::fs::read(&other).unwrap(), before);
+}
+
+#[test]
+fn a_lone_picture_with_a_face_tag_keeps_its_whole_name() {
+    // city_ny.png opened alone is not city's -Y face: city.png beside it also saves as city_e.png.
+    let d = temp("lone-tag");
+    let mut h = rig();
+    open(&mut h, &png(&d, "city_ny.png", 64, 32));
+    settle(&mut h);
+    h.get_by_role_and_label(Role::Button, "Save").click_accesskit();
+    h.run_steps(2);
+    saved(&mut h);
+    assert!(d.join("city_ny_e.png").is_file(), "status {:?}", h.state().status);
+    assert!(!d.join("city_e.png").exists());
+}
+
+#[test]
+fn a_file_still_being_read_already_counts_as_open() {
+    // Another tab's Save asks for this list: a file picked here must be kept before its pixels have arrived.
+    let d = temp("opening");
+    let p = png(&d, "pano.png", 64, 32);
+    let mut h = rig();
+    let ctx = h.ctx.clone();
+    h.state_mut().open(p.clone(), &ctx);
+    assert_eq!(h.state().open_files(), vec![p.clone()]);
+    settle(&mut h);
+    assert_eq!(h.state().open_files(), vec![p]);
+}
+
+#[test]
+fn a_question_is_not_closed_by_the_arrival_of_a_source_picked_before_it() {
+    let d = temp("saving-pick");
+    let mut h = rig();
+    open(&mut h, &png(&d, "pano.png", 64, 32));
+    settle(&mut h);
+    let path = d.join("taken.png");
+    std::fs::write(&path, b"someone else's file").unwrap();
+    let (gate, wait) = std::sync::mpsc::channel::<()>();
+    let saving = texalith::save::start(&h.ctx, vec![], Box::new(|w, k| format!("{w} written, {k} kept")), move || {
+        let _ = wait.recv();
+        vec![(MapKind::Cube, texalith::export::Planned { path, bytes: vec![1, 2, 3] })]
+    });
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    // The pick, then the save's question, then the new source's arrival: all three before the next frame.
+    let ctx = h.ctx.clone();
+    h.state_mut().open(png(&d, "other.png", 64, 32), &ctx);
+    gate.send(()).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    settle(&mut h);
+    assert!(shown(&h, "Some files will be kept"), "the question is still there to answer");
+}
+
+#[test]
+fn a_save_line_is_not_wiped_by_the_arrival_of_a_source_picked_before_it() {
+    let d = temp("saving-line");
+    let mut h = rig();
+    open(&mut h, &png(&d, "pano.png", 64, 32));
+    settle(&mut h);
+    let (gate, saving) = held_save(&h.ctx);
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    // The pick, then the save's report, then the new source's arrival: all three before the next frame.
+    let ctx = h.ctx.clone();
+    h.state_mut().open(png(&d, "other.png", 64, 32), &ctx);
+    gate.send(()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    settle(&mut h);
+    assert!(h.state().outputs.is_some(), "the new source has its cube");
+    assert_eq!(h.state().status, Some(Ok("0 written, 0 kept".into())));
+}
+
+#[test]
+fn picking_another_source_closes_the_dialog_and_the_status_line() {
+    let d = temp("pick-closes");
+    let mut h = rig();
+    open(&mut h, &png(&d, "pano.png", 64, 32));
+    settle(&mut h);
+    let path = d.join("taken.png");
+    std::fs::write(&path, b"someone else's file").unwrap();
+    let saving = texalith::save::start(&h.ctx, vec![], Box::new(|w, k| format!("{w} written, {k} kept")), move || {
+        vec![(MapKind::Cube, texalith::export::Planned { path, bytes: vec![1, 2, 3] })]
+    });
+    h.state_mut().saving = Some(saving);
+    saved(&mut h);
+    assert!(shown(&h, "Some files will be kept"));
+    h.state_mut().status = Some(Err("a line about the old source".into()));
+    let ctx = h.ctx.clone();
+    h.state_mut().open(png(&d, "other.png", 64, 32), &ctx);
+    assert!(h.state().review.is_none() && h.state().status.is_none());
+}
+
+#[test]
+fn the_refusal_line_goes_when_a_fitting_type_is_picked() {
+    let d = temp("refuse-then-fit");
+    let mut h = rig();
+    open(&mut h, &png(&d, "pano.png", 64, 32));
+    pick(&mut h, "Horizontal strip (6:1)");
+    settle(&mut h);
+    assert!(matches!(h.state().status, Some(Err(_))));
+    pick(&mut h, "Panorama (2:1)");
+    settle(&mut h);
+    assert_eq!(h.state().status, None);
 }

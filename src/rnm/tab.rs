@@ -1,12 +1,12 @@
 //! The RNM tab: the base, the layer list, the jobs it sends, and the column of controls.
-use super::blend::decode_base;
-use super::files::{self, rnm_png, Loaded, Recorded};
+use super::blend::{decode_base, red};
+use super::files::{self, rnm_png, Loaded, Plane, Recorded};
 use super::worker::{Job, Output};
 use super::{Input, Kind, Layer};
-use crate::export::{free_name, Planned};
+use crate::export::{file_name, free_name, Planned};
 use crate::from_normal::files::{source, Source};
 use crate::marker::MapKind;
-use crate::save::{self, Review};
+use crate::save::{self, Review, Saving};
 use crate::settle::{self, Settle};
 use crate::tab::{error_line, folder_row, hint, line, slider_row_named, Row, EXTENSIONS};
 use eframe::egui;
@@ -67,12 +67,21 @@ pub struct LayerState {
     /// What the strength reset goes back to.
     pub default: f32,
     pub file: Option<Loaded>,
-    pub mask: Option<Loaded>,
-    pub ao: Option<Loaded>,
+    pub mask: Option<Plane>,
+    pub ao: Option<Plane>,
+}
+
+/// What a load thread read, shaped for where it goes.
+enum Read {
+    /// The base's file and its image as `decode_base`d; the raw image is not kept.
+    Base(Source, Arc<Rgba32F>),
+    Layer(Loaded),
+    /// A mask or an AO map.
+    Plane(Plane),
 }
 
 /// A file being read on a thread: for the base (`None`) or a layer's file.
-type Pending = (Option<Slot>, Receiver<Result<(Loaded, (u32, u32)), String>>);
+type Pending = (Option<Slot>, PathBuf, Receiver<Result<Read, String>>);
 
 pub struct RnmTab {
     jobs: Sender<Job>,
@@ -89,6 +98,10 @@ pub struct RnmTab {
     pub jobs_sent: u64,
     /// A Save waiting on the overwrite dialog.
     pub review: Option<Review>,
+    /// A Save encoding or writing on its thread.
+    pub saving: Option<Saving>,
+    /// The files open in the other tabs, set by the app: Save keeps them as it keeps its own sources.
+    pub elsewhere: Vec<PathBuf>,
     loads: Vec<Pending>,
     /// The layers and settings of the newest job, so any change in the column sends a job. The uid is part of it, so
     /// two layers with equal settings swapping places is a change.
@@ -103,23 +116,28 @@ pub struct RnmTab {
     drop_at: Option<usize>,
 }
 
-fn name_of(p: &Path) -> String {
-    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-}
-
-/// `path` hashed and decoded, with its size; the `Err` names the file.
-fn load(path: &Path) -> Result<(Loaded, (u32, u32)), String> {
-    let fail = |e: &dyn std::fmt::Display| format!("Could not read {}: {e}", name_of(path));
-    let src = source(path).map_err(|e| fail(&e))?;
+/// `path` hashed and decoded for `part` of a layer, or for the base (`None`); the `Err` names the file. Runs on a
+/// load thread, so the base is `decode_base`d here and not on the window's thread.
+fn load(path: &Path, part: Option<Part>) -> Result<Read, String> {
+    let fail = |e: &dyn std::fmt::Display| format!("Could not read {}: {e}", file_name(path));
+    // The header alone gives the size, so a file too large is refused before it is hashed and decoded (a 16384
+    // image is 4 GB decoded). A header this cannot read is left to the decoder, which names its own error.
+    if let Some(why) = engine::load::image_size(path).ok().and_then(|size| files::oversize(path, size)) {
+        return Err(why);
+    }
+    let source = source(path).map_err(|e| fail(&e))?;
     let (img, _) = engine::load::load_image(path).map_err(|e| fail(&e))?;
-    let size = (img.width, img.height);
-    Ok((Loaded { source: src, img: Arc::new(img) }, size))
+    Ok(match part {
+        None => Read::Base(source, Arc::new(decode_base(&img))),
+        Some(Part::File) => Read::Layer(Loaded { source, img: Arc::new(img) }),
+        Some(Part::Mask | Part::Ao) => Read::Plane(Plane { source, img: Arc::new(red(&img)) }),
+    })
 }
 
 /// `f`, with a panic turned into an `Err` that names the file, so a reader bug is reported instead of dropped.
 pub(crate) fn guarded<T>(path: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-        .unwrap_or_else(|_| Err(format!("Could not read {}: the image reader stopped on it.", name_of(path))))
+        .unwrap_or_else(|_| Err(format!("Could not read {}: the image reader stopped on it.", file_name(path))))
 }
 
 fn pick() -> Option<PathBuf> {
@@ -168,12 +186,12 @@ fn named_checkbox(ui: &mut egui::Ui, v: &mut bool, text: &str, what: &str) {
 }
 
 /// The file name (full path on hover) or `empty`, then "Choose…" named `choose` and, when `clear` names one, a clear button.
-fn slot_row(ui: &mut egui::Ui, file: Option<&Loaded>, empty: &str, choose: &str, clear: Option<&str>, slot: Slot, acts: &mut Vec<Act>) {
+fn slot_row(ui: &mut egui::Ui, file: Option<&Source>, empty: &str, choose: &str, clear: Option<&str>, slot: Slot, acts: &mut Vec<Act>) {
     egui::Sides::new().shrink_left().truncate().show(
         ui,
         |ui| match file {
-            Some(l) => {
-                ui.add(egui::Label::new(name_of(&l.source.path)).truncate()).on_hover_text(l.source.path.display().to_string());
+            Some(s) => {
+                ui.add(egui::Label::new(file_name(&s.path)).truncate()).on_hover_text(s.path.display().to_string());
             }
             None => {
                 ui.weak(empty);
@@ -204,6 +222,8 @@ impl RnmTab {
             status: None,
             jobs_sent: 0,
             review: None,
+            saving: None,
+            elsewhere: vec![],
             loads: vec![],
             sent: None,
             settle: Settle::default(),
@@ -217,11 +237,13 @@ impl RnmTab {
     fn start_load(&mut self, slot: Option<Slot>, path: PathBuf, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
+        let part = slot.map(|s| s.part);
+        let file = path.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(guarded(&path, || load(&path)));
+            let _ = tx.send(guarded(&path, || load(&path, part)));
             ctx.request_repaint();
         });
-        self.loads.push((slot, rx));
+        self.loads.push((slot, file, rx));
     }
 
     /// Reads `path` on a thread; on arrival a refused base sets the status and changes nothing else. A base still
@@ -231,13 +253,18 @@ impl RnmTab {
             self.status = Some(Err(why));
             return;
         }
-        self.loads.retain(|(s, _)| s.is_some());
+        // The pick closes the old file's dialog and status line, not the arrival: a running save may ask or report
+        // while the file is read, and that answer is not the old file's dialog.
+        (self.review, self.status) = (None, None);
+        self.loads.retain(|(s, ..)| s.is_some());
         self.start_load(None, path, ctx);
     }
 
     /// Reads `path` into `slot` on a thread; on arrival it sends a job, or reports the file and leaves the slot. A
-    /// file whose layer is gone by then is dropped.
+    /// file whose layer is gone by then is dropped, and so is a file still loading for the same slot: the last one
+    /// chosen wins.
     pub fn fill(&mut self, slot: Slot, path: PathBuf, ctx: &egui::Context) {
+        self.loads.retain(|(s, ..)| *s != Some(slot));
         self.start_load(Some(slot), path, ctx);
     }
 
@@ -264,7 +291,7 @@ impl RnmTab {
 
     /// Takes the layer away, with any of its files still being read.
     pub fn remove_layer(&mut self, uid: u64) {
-        self.loads.retain(|(s, _)| s.is_none_or(|s| s.layer != uid));
+        self.loads.retain(|(s, ..)| s.is_none_or(|s| s.layer != uid));
         self.layers.retain(|l| l.uid != uid);
     }
 
@@ -276,8 +303,12 @@ impl RnmTab {
         }
     }
 
-    /// Empties a mask or an AO map. A layer's own file is not cleared; `remove_layer` takes the layer away.
+    /// Empties a mask or an AO map, with a file still loading for it. A layer's own file is not cleared;
+    /// `remove_layer` takes the layer away.
     pub fn clear(&mut self, slot: Slot) {
+        if slot.part != Part::File {
+            self.loads.retain(|(s, ..)| *s != Some(slot));
+        }
         let Some(l) = self.layers.iter_mut().find(|l| l.uid == slot.layer) else { return };
         let had = match slot.part {
             Part::Mask => l.mask.take().is_some(),
@@ -302,8 +333,7 @@ impl RnmTab {
             .iter()
             .filter_map(|l| {
                 let img = l.file.as_ref()?.img.clone();
-                // The AO map is read from its red channel.
-                Some(Input { set: l.set, img, mask: l.mask.as_ref().map(|m| m.img.clone()), ao: l.ao.as_ref().map(|a| (a.img.clone(), 0)) })
+                Some(Input { set: l.set, img, mask: l.mask.as_ref().map(|m| m.img.clone()), ao: l.ao.as_ref().map(|a| a.img.clone()) })
             })
             .collect();
         let job = Job { id: self.jobs_sent, base: decoded.clone(), layers };
@@ -336,19 +366,17 @@ impl RnmTab {
         new
     }
 
-    fn accept_base(&mut self, l: Loaded, size: (u32, u32), ctx: &egui::Context) {
-        let Loaded { source, img } = l;
+    fn accept_base(&mut self, source: Source, decoded: Arc<Rgba32F>, ctx: &egui::Context) {
         let path = source.path.clone();
-        if let Some(why) = files::refuse(&path, size) {
+        if let Some(why) = files::refuse(&path, (decoded.width, decoded.height)) {
             self.status = Some(Err(why));
             return;
         }
-        let decoded = Arc::new(decode_base(&img));
-        drop(img);
         // Layer files still loading were chosen for the old base.
-        self.loads.retain(|(s, _)| s.is_none());
+        self.loads.retain(|(s, ..)| s.is_none());
         self.layers.clear();
-        (self.outputs, self.review, self.status) = (None, None, None);
+        // A running save is left to finish: it reports, or asks, when it is done.
+        self.outputs = None;
         self.folder = path.parent().map(PathBuf::from);
         self.base = Some((source, decoded));
         self.base_job = self.jobs_sent + 1;
@@ -369,7 +397,7 @@ impl RnmTab {
 
     fn poll_loads(&mut self, ctx: &egui::Context) {
         let mut arrived = vec![];
-        self.loads.retain(|(slot, rx)| match rx.try_recv() {
+        self.loads.retain(|(slot, _, rx)| match rx.try_recv() {
             Ok(r) => {
                 arrived.push((*slot, r));
                 false
@@ -380,22 +408,26 @@ impl RnmTab {
         for (slot, r) in arrived {
             match (slot, r) {
                 (_, Err(e)) => self.status = Some(Err(e)),
-                (None, Ok((l, size))) => self.accept_base(l, size, ctx),
-                (Some(s), Ok((l, _))) => {
+                (None, Ok(Read::Base(source, decoded))) => self.accept_base(source, decoded, ctx),
+                (Some(s), Ok(read)) => {
                     // A layer removed while its file was read has no place for it.
                     let Some(layer) = self.layers.iter_mut().find(|x| x.uid == s.layer) else { continue };
-                    match s.part {
-                        Part::File => layer.file = Some(l),
-                        Part::Mask => layer.mask = Some(l),
-                        Part::Ao => layer.ao = Some(l),
+                    match (s.part, read) {
+                        (Part::File, Read::Layer(l)) => layer.file = Some(l),
+                        (Part::Mask, Read::Plane(p)) => layer.mask = Some(p),
+                        (Part::Ao, Read::Plane(p)) => layer.ao = Some(p),
+                        // `load` shapes what it read by the part it was given.
+                        _ => continue,
                     }
                     self.submit();
                 }
+                (None, Ok(_)) => {}
             }
         }
     }
 
     pub fn draw_column(&mut self, ui: &mut egui::Ui) {
+        save::poll(&mut self.saving, &mut self.review, &mut self.status);
         self.poll_loads(ui.ctx());
         let mut acts = vec![];
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
@@ -465,7 +497,8 @@ impl RnmTab {
             match save::dialog(ui.ctx(), r) {
                 Some(true) => {
                     let r = self.review.take().expect("the dialog is open");
-                    self.write(&r);
+                    let open = [self.open_files(), self.elsewhere.clone()].concat();
+                    self.saving = Some(save::start_write(ui.ctx(), r, open));
                 }
                 Some(false) => self.review = None,
                 None => {}
@@ -498,7 +531,7 @@ impl RnmTab {
         }
         match &self.base {
             Some((s, _)) => {
-                ui.add(egui::Label::new(egui::RichText::new(name_of(&s.path)).strong()).truncate())
+                ui.add(egui::Label::new(egui::RichText::new(file_name(&s.path)).strong()).truncate())
                     .on_hover_text(s.path.display().to_string());
             }
             None => {
@@ -571,7 +604,7 @@ impl RnmTab {
                     }
                 },
             );
-            slot_row(ui, l.file.as_ref(), "None", &format!("Choose file for layer {n}"), None, slot(Part::File), acts);
+            slot_row(ui, l.file.as_ref().map(|f| &f.source), "None", &format!("Choose file for layer {n}"), None, slot(Part::File), acts);
             if l.file.is_none() {
                 return;
             }
@@ -593,7 +626,7 @@ impl RnmTab {
                 hint(ui, &format!("Layer {n} mask"), HELP_MASK);
             });
             let (choose, clear) = (format!("Choose mask for layer {n}"), format!("Clear mask for layer {n}"));
-            slot_row(ui, l.mask.as_ref(), "No mask", &choose, Some(&clear), slot(Part::Mask), acts);
+            slot_row(ui, l.mask.as_ref().map(|m| &m.source), "No mask", &choose, Some(&clear), slot(Part::Mask), acts);
             if kind != Kind::Bent {
                 return;
             }
@@ -605,7 +638,7 @@ impl RnmTab {
             if l.set.use_ao {
                 ui.label("AO map");
                 let (choose, clear) = (format!("Choose AO map for layer {n}"), format!("Clear AO map for layer {n}"));
-                slot_row(ui, l.ao.as_ref(), "No AO map", &choose, Some(&clear), slot(Part::Ao), acts);
+                slot_row(ui, l.ao.as_ref().map(|a| &a.source), "No AO map", &choose, Some(&clear), slot(Part::Ao), acts);
                 let row = Row { name: "Focus on crevices", range: 0.1..=8.0, default: 1.5, help: HELP_FOCUS, scale: 1.0, suffix: "", decimals: 2, log: true };
                 slider_row_named(ui, &row, &mut l.set.ao_power, &format!("Layer {n} focus on crevices"));
             }
@@ -618,21 +651,38 @@ impl RnmTab {
         self.base.as_ref().map(|(s, _)| s.path.as_path())
     }
 
-    /// The output's file name in the save folder: the first numbered name that is no file the tab has open.
+    /// The files this tab has open: the base first, then every layer's files, then those still being read.
+    pub fn open_files(&self) -> Vec<PathBuf> {
+        let files = self
+            .layers
+            .iter()
+            .flat_map(|l| [l.file.as_ref().map(|f| &f.source), l.mask.as_ref().map(|m| &m.source), l.ao.as_ref().map(|a| &a.source)])
+            .flatten();
+        let loading = self.loads.iter().map(|(_, p, _)| p.clone());
+        self.base_path().into_iter().map(Path::to_path_buf).chain(files.map(|s| s.path.clone())).chain(loading).collect()
+    }
+
+    /// The output's file name in the save folder: the first numbered name that is no file open in Texalith.
     fn save_name(&self) -> Option<String> {
         let (b, f) = (self.base_path()?, self.folder.as_ref()?);
-        let files = self.layers.iter().flat_map(|l| [&l.file, &l.mask, &l.ao]).flatten();
-        let taken: Vec<&Path> = std::iter::once(b).chain(files.map(|l| l.source.path.as_path())).collect();
+        let open = self.open_files();
+        let taken: Vec<&Path> = open.iter().chain(&self.elsewhere).map(PathBuf::as_path).collect();
         Some(free_name(f, &files::out_name(b), &taken))
     }
 
     fn save_rows(&mut self, ui: &mut egui::Ui) {
         folder_row(ui, &mut self.folder);
         let name = self.save_name();
-        let ready = self.outputs.as_ref().is_some_and(|o| o.id == self.jobs_sent) && !self.busy() && name.is_some();
+        let ready = self.outputs.as_ref().is_some_and(|o| o.id == self.jobs_sent)
+            && !self.busy()
+            && name.is_some()
+            && self.saving.is_none();
         let save = ui.add_enabled(ready, egui::Button::new("Save"));
         if save.on_hover_text(format!("Saves as {}", name.unwrap_or_default())).clicked() {
-            self.save();
+            self.save(ui.ctx());
+        }
+        if self.saving.is_some() {
+            save::saving_row(ui);
         }
         match &self.status {
             Some(Ok(m)) => line(ui, m),
@@ -641,38 +691,30 @@ impl RnmTab {
         }
     }
 
-    /// Writes at once when nothing on disk needs a choice; otherwise opens the dialog.
-    // shortcut: encode, review and write run on the UI thread, as the Material tab's do; move them to a thread if a
-    // 4096 save freezes the window.
-    fn save(&mut self) {
+    /// Encodes and writes on a thread (`save::start`): at once when nothing on disk needs a choice, otherwise the
+    /// dialog opens when the thread answers.
+    fn save(&mut self, ctx: &egui::Context) {
         let (Some((base, _)), Some(out), Some(f), Some(name)) = (&self.base, &self.outputs, &self.folder, self.save_name()) else {
             return;
         };
+        let (base, out, path) = (base.clone(), out.clone(), f.join(&name));
         // Only a layer with a file is blended, so only those are recorded.
-        let layers: Vec<Recorded> = self
+        let layers: Vec<(Layer, Source, Option<Source>, Option<Source>)> = self
             .layers
             .iter()
-            .filter_map(|l| Some(Recorded { set: l.set, file: l.file.as_ref()?, mask: l.mask.as_ref(), ao: l.ao.as_ref() }))
+            .filter_map(|l| {
+                let of = |p: &Option<Plane>| p.as_ref().map(|p| p.source.clone());
+                Some((l.set, l.file.as_ref()?.source.clone(), of(&l.mask), of(&l.ao)))
+            })
             .collect();
-        let bytes = rnm_png(out.size.0, out.size.1, &out.px, base, &layers);
-        let plan = vec![(MapKind::Rnm, Planned { path: f.join(name), bytes })];
-        let r = save::review(plan, &base.path);
-        match r.needs_dialog() {
-            true => self.review = Some(r),
-            false => self.write(&r),
-        }
-    }
-
-    /// All or nothing; an `Err` names the failing file and says nothing was changed.
-    fn write(&mut self, r: &Review) {
-        let (Some(b), Some(f), Some(file)) = (self.base_path(), &self.folder, self.save_name()) else { return };
-        let kept = r.kept();
-        let result = r.write(b).map(|written| match (written.len(), kept) {
-            (0, 0) => format!("Nothing to save: {file} in {} already matches", f.display()),
-            (0, _) => format!("Nothing saved: {file} was kept in {}", f.display()),
-            _ => format!("Saved {file} to {}", f.display()),
-        });
-        self.status = Some(result);
+        let sources = [self.open_files(), self.elsewhere.clone()].concat();
+        self.status = None;
+        self.saving = Some(save::start(ctx, sources, save::says_one(f.clone(), name), move || {
+            let recorded: Vec<Recorded> =
+                layers.iter().map(|(set, file, mask, ao)| Recorded { set: *set, file, mask: mask.as_ref(), ao: ao.as_ref() }).collect();
+            let bytes = rnm_png(out.size.0, out.size.1, &out.px, &base, &recorded);
+            vec![(MapKind::Rnm, Planned { path, bytes })]
+        }));
     }
 }
 

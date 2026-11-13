@@ -32,7 +32,7 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(
+    let run = eframe::run_native(
         "Texalith",
         options,
         Box::new(|cc| {
@@ -65,5 +65,11 @@ fn main() -> eframe::Result {
             app.restarted = restart::is_restart();
             Ok(Box::new(Shell(app)))
         }),
-    )
+    );
+    // The window is gone; a save still running finishes before the process ends.
+    texalith::save::wait();
+    if let Err(e) = &run {
+        restart::fatal(&format!("Texalith could not open its window: {e}"));
+    }
+    run
 }

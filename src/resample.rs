@@ -1,6 +1,7 @@
 //! Area and bilinear resampling. Copied from Tessalith at 36384560 (GPL-3.0): engine's `area_resample`
 //! (`crates/engine/src/mips.rs`) is crate-private, and `rnm::blend::resample` goes in Tessalith 3.0.
 use engine::image::Rgba32F;
+use std::borrow::Cow;
 
 /// Per destination texel, the source texels it covers and their area shares (`n` → `m` along one axis); the shares
 /// of one destination texel sum to 1.
@@ -44,14 +45,14 @@ fn area_resample(prev: &Rgba32F, (w, h): (u32, u32)) -> Rgba32F {
     out
 }
 
-/// `img` at `size`: unchanged when equal, the area filter when no axis grows, else bilinear (texel centres, clamped
-/// edges).
-pub fn resample(img: Rgba32F, size: (u32, u32)) -> Rgba32F {
+/// `img` at `size`: borrowed as it is when equal, the area filter when no axis grows, else bilinear (texel centres,
+/// clamped edges).
+pub fn resample(img: &Rgba32F, size: (u32, u32)) -> Cow<'_, Rgba32F> {
     if (img.width, img.height) == size {
-        return img;
+        return Cow::Borrowed(img);
     }
     if img.width >= size.0 && img.height >= size.1 {
-        return area_resample(&img, size);
+        return Cow::Owned(area_resample(img, size));
     }
     let (sx, sy) = (img.width as f32 / size.0 as f32, img.height as f32 / size.1 as f32);
     let axis = |o: u32, s: f32, n: u32| {
@@ -73,7 +74,7 @@ pub fn resample(img: Rgba32F, size: (u32, u32)) -> Rgba32F {
             }
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -83,7 +84,7 @@ mod tests {
     #[test]
     fn a_box_down_keeps_the_mean() {
         let img = Rgba32F { width: 4, height: 4, px: (0..16).map(|i| [i as f32; 4]).collect() };
-        let r = resample(img, (2, 2));
+        let r = resample(&img, (2, 2));
         assert_eq!(r.px.iter().map(|p| p[0]).collect::<Vec<_>>(), vec![2.5, 4.5, 10.5, 12.5]);
     }
 }

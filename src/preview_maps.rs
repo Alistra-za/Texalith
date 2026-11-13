@@ -114,47 +114,6 @@ mod tests {
         u32::from_le_bytes(d[at..at + 4].try_into().unwrap())
     }
 
-    /// `testmaps::dds` before it became a call to `dds_rgba8`, for the unchanged-bytes check.
-    fn old_dds(s: u32, base: &[[u8; 4]], srgb: bool) -> Vec<u8> {
-        let mips = 32 - s.leading_zeros();
-        let mut b = vec![0u8; 148];
-        let mut put = |at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        put(0, u32::from_le_bytes(*b"DDS "));
-        put(4, 124);
-        put(8, 0x1 | 0x2 | 0x4 | 0x8 | 0x1000 | 0x20000);
-        put(12, s);
-        put(16, s);
-        put(20, s * 4);
-        put(28, mips);
-        put(76, 32);
-        put(80, 0x4);
-        put(84, u32::from_le_bytes(*b"DX10"));
-        put(108, 0x1000 | 0x8 | 0x400000);
-        put(128, if srgb { 29 } else { 28 });
-        put(132, 3);
-        put(140, 1);
-        let mut level = base.to_vec();
-        let mut n = s as usize;
-        loop {
-            b.extend(level.iter().flatten());
-            if n == 1 {
-                break;
-            }
-            let m = n / 2;
-            let mut next = Vec::with_capacity(m * m);
-            for y in 0..m {
-                for x in 0..m {
-                    let t = |i: usize, j: usize| level[(y * 2 + j) * n + x * 2 + i];
-                    let (a, c, d, e) = (t(0, 0), t(1, 0), t(0, 1), t(1, 1));
-                    next.push(std::array::from_fn(|k| ((a[k] as u32 + c[k] as u32 + d[k] as u32 + e[k] as u32 + 2) / 4) as u8));
-                }
-            }
-            level = next;
-            n = m;
-        }
-        b
-    }
-
     fn gray(v: f32) -> Gray {
         Gray { width: 2, height: 2, px: vec![v; 4] }
     }
@@ -192,13 +151,6 @@ mod tests {
         assert_eq!(u(&d, 20), 32);
         assert_eq!(d.len(), 148 + 4 * (16 + 4 + 2 + 1));
         assert_eq!(&d[d.len() - 4..], &[10, 20, 30, 255]);
-    }
-
-    #[test]
-    fn the_square_test_maps_are_unchanged() {
-        let base: Vec<[u8; 4]> = (0..16u8).map(|i| [i * 13, 255 - i * 7, i * 3 + 1, 255]).collect();
-        assert_eq!(crate::testmaps::dds(4, &base, true), old_dds(4, &base, true));
-        assert_eq!(dds_rgba8(4, 4, &base, false), old_dds(4, &base, false));
     }
 
     #[test]

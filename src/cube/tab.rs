@@ -6,11 +6,11 @@ use super::open::{self, Opened};
 use super::view::FACE_LABELS;
 use super::worker::{Job, Output};
 use super::{default_softness, Flip, Ground, Settings, SourceType};
-use crate::export::{free_name, Planned};
+use crate::export::{file_name, free_name, Planned};
 use crate::from_normal::files::Source;
 use crate::marker::MapKind;
 use crate::rnm::tab::guarded;
-use crate::save::{self, Review};
+use crate::save::{self, Review, Saving};
 use crate::settle::{self, Settle};
 use crate::tab::{error_line, folder_row, hint, line, slider_row, Row, EXTENSIONS};
 use eframe::egui;
@@ -57,10 +57,16 @@ pub struct CubeTab {
     pub jobs_sent: u64,
     /// A Save waiting on the overwrite dialog.
     pub review: Option<Review>,
+    /// A Save encoding or writing on its thread.
+    pub saving: Option<Saving>,
+    /// The files open in the other tabs, set by the app: Save keeps them as it keeps its own sources.
+    pub elsewhere: Vec<PathBuf>,
     /// The source being read; a newer open replaces it, so the last one opened wins.
-    load: Option<Receiver<Result<Opened, String>>>,
+    load: Option<(PathBuf, Receiver<Result<Opened, String>>)>,
     /// The settings last acted on (sent, or refused as not fitting), so any change in the column is acted on once.
     sent: Option<Settings>,
+    /// The "does not fit" line `act` put in `status`, so it clears that line and no other.
+    misfit_said: Option<String>,
     settle: Settle<Settings>,
     /// The id of the current source's first job; older outputs belong to another source.
     first_job: u64,
@@ -76,10 +82,6 @@ fn ground_name(g: Ground) -> &'static str {
     }
 }
 
-fn name_of(p: &Path) -> String {
-    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-}
-
 impl CubeTab {
     pub fn new(jobs: Sender<Job>, replies: Receiver<Arc<Output>>) -> CubeTab {
         CubeTab {
@@ -92,8 +94,11 @@ impl CubeTab {
             status: None,
             jobs_sent: 0,
             review: None,
+            saving: None,
+            elsewhere: vec![],
             load: None,
             sent: None,
+            misfit_said: None,
             settle: Settle::default(),
             first_job: 0,
             fix_face: 0,
@@ -102,13 +107,17 @@ impl CubeTab {
 
     /// Reads `path` (and its five siblings for a face file) on a thread. A source still loading is dropped.
     pub fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        // The pick closes the old file's dialog and status line, not the arrival: a running save may ask or report
+        // while the file is read, and that answer is not the old file's dialog.
+        (self.review, self.status) = (None, None);
         let (tx, rx) = channel();
         let ctx = ctx.clone();
+        let file = path.clone();
         std::thread::spawn(move || {
             let _ = tx.send(guarded(&path, || open::open(&path)));
             ctx.request_repaint();
         });
-        self.load = Some(rx);
+        self.load = Some((file, rx));
     }
 
     /// A source is still being read.
@@ -142,7 +151,7 @@ impl CubeTab {
     }
 
     fn poll_load(&mut self) {
-        let Some(rx) = &self.load else { return };
+        let Some((_, rx)) = &self.load else { return };
         let r = match rx.try_recv() {
             Ok(r) => r,
             Err(TryRecvError::Empty) => return,
@@ -152,7 +161,8 @@ impl CubeTab {
         match r {
             Err(e) => self.status = Some(Err(e)),
             Ok(o) => {
-                (self.outputs, self.review, self.status, self.sent) = (None, None, None, None);
+                // A running save is left to finish: it reports, or asks, when it is done.
+                (self.outputs, self.sent) = (None, None);
                 self.folder = o.sources[0].path.parent().map(PathBuf::from);
                 self.settings =
                     Settings { source: o.detected, softness: default_softness(o.detected), ..Settings::default() };
@@ -172,7 +182,7 @@ impl CubeTab {
         let o = self.opened.as_ref()?;
         let img = &o.imgs[0];
         let ok = if o.imgs.len() == 6 { t == SourceType::Faces } else { fits(t, img.width, img.height) };
-        (!ok).then(|| format!("{} is {}x{}, which does not fit {}.", name_of(&o.sources[0].path), img.width, img.height, t.name()))
+        (!ok).then(|| format!("{} is {}x{}, which does not fit {}.", file_name(&o.sources[0].path), img.width, img.height, t.name()))
     }
 
     /// The picked type reads the source.
@@ -196,15 +206,20 @@ impl CubeTab {
         self.sent = Some(self.settings.clone());
         let Some(t) = self.settings.source else { return };
         if let Some(why) = self.misfit(t) {
+            self.misfit_said = Some(why.clone());
             self.status = Some(Err(why));
             return;
         }
-        self.status = None;
+        // A save's line stays, as in the other tabs: it may have landed while this source was being read.
+        if self.misfit_said.take().is_some_and(|m| self.status == Some(Err(m))) {
+            self.status = None;
+        }
         self.jobs_sent += 1;
         let _ = self.jobs.send(Job { id: self.jobs_sent, opened, source: t, settings: self.settings.clone() });
     }
 
     pub fn draw_column(&mut self, ui: &mut egui::Ui) {
+        save::poll(&mut self.saving, &mut self.review, &mut self.status);
         self.poll_load();
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         if self.opened.is_some() {
@@ -231,7 +246,8 @@ impl CubeTab {
             match save::dialog(ui.ctx(), r) {
                 Some(true) => {
                     let r = self.review.take().expect("the dialog is open");
-                    self.write(&r);
+                    let open = [self.open_files(), self.elsewhere.clone()].concat();
+                    self.saving = Some(save::start_write(ui.ctx(), r, open));
                 }
                 Some(false) => self.review = None,
                 None => {}
@@ -255,7 +271,7 @@ impl CubeTab {
         }
         match self.first_source() {
             Some(s) => {
-                ui.add(egui::Label::new(egui::RichText::new(name_of(&s.path)).strong()).truncate())
+                ui.add(egui::Label::new(egui::RichText::new(file_name(&s.path)).strong()).truncate())
                     .on_hover_text(s.path.display().to_string());
             }
             None => {
@@ -433,11 +449,18 @@ impl CubeTab {
         }
     }
 
-    /// The output's file name in the save folder: the first numbered name that is none of the sources.
+    /// The files this tab has open, with one still being read.
+    // shortcut: the five siblings of a face file are listed only once the set has been read.
+    pub fn open_files(&self) -> Vec<PathBuf> {
+        let loading = self.load.iter().map(|(p, _)| p.clone());
+        self.opened.iter().flat_map(|o| o.sources.iter().map(|s| s.path.clone())).chain(loading).collect()
+    }
+
+    /// The output's file name in the save folder: the first numbered name that is no file open in Texalith.
     fn save_name(&self) -> Option<String> {
         let (o, f) = (self.opened.as_ref()?, self.folder.as_ref()?);
-        let taken: Vec<&Path> = o.sources.iter().map(|s| s.path.as_path()).collect();
-        Some(free_name(f, &files::out_name(&o.sources.first()?.path), &taken))
+        let taken: Vec<&Path> = o.sources.iter().map(|s| s.path.as_path()).chain(self.elsewhere.iter().map(PathBuf::as_path)).collect();
+        Some(free_name(f, &files::out_name(&o.sources.first()?.path, o.sources.len() == 6), &taken))
     }
 
     fn save_rows(&mut self, ui: &mut egui::Ui) {
@@ -446,10 +469,14 @@ impl CubeTab {
         let ready = self.outputs.as_ref().is_some_and(|o| o.id == self.jobs_sent)
             && self.fitting().is_some()
             && !self.busy()
-            && name.is_some();
+            && name.is_some()
+            && self.saving.is_none();
         let save = ui.add_enabled(ready, egui::Button::new("Save"));
         if save.on_hover_text(format!("Saves as {}", name.unwrap_or_default())).clicked() {
-            self.save();
+            self.save(ui.ctx());
+        }
+        if self.saving.is_some() {
+            save::saving_row(ui);
         }
         match &self.status {
             Some(Ok(m)) => line(ui, m),
@@ -458,34 +485,19 @@ impl CubeTab {
         }
     }
 
-    /// Writes at once when nothing on disk needs a choice; otherwise opens the dialog.
-    // shortcut: encode, review and write run on the UI thread, as the other tabs' do; move them to a thread if a
-    // 2048-face save (plan 6) freezes the window.
-    fn save(&mut self) {
+    /// Encodes and writes on a thread (`save::start`): at once when nothing on disk needs a choice, otherwise the
+    /// dialog opens when the thread answers.
+    fn save(&mut self, ctx: &egui::Context) {
         let (Some(o), Some(out), Some(f), Some(name)) = (&self.opened, &self.outputs, &self.folder, self.save_name()) else {
             return;
         };
-        let keys: &[&'static str] = if o.sources.len() == 6 { &FACE_KEYS } else { &["source"] };
-        let inputs: Vec<(&'static str, &Source)> = keys.iter().copied().zip(&o.sources).collect();
-        let bytes = cube_png(&out.cube, &inputs, &self.settings);
-        let first = &o.sources[0].path;
-        let plan = vec![(MapKind::Cube, Planned { path: f.join(name), bytes })];
-        let r = save::review(plan, first);
-        match r.needs_dialog() {
-            true => self.review = Some(r),
-            false => self.write(&r),
-        }
-    }
-
-    /// All or nothing; an `Err` names the failing file and says nothing was changed.
-    fn write(&mut self, r: &Review) {
-        let (Some(s), Some(f), Some(file)) = (self.first_source(), &self.folder, self.save_name()) else { return };
-        let kept = r.kept();
-        let result = r.write(&s.path).map(|written| match (written.len(), kept) {
-            (0, 0) => format!("Nothing to save: {file} in {} already matches", f.display()),
-            (0, _) => format!("Nothing saved: {file} was kept in {}", f.display()),
-            _ => format!("Saved {file} to {}", f.display()),
-        });
-        self.status = Some(result);
+        let (o, out, settings, path) = (o.clone(), out.clone(), self.settings.clone(), f.join(&name));
+        let sources = [self.open_files(), self.elsewhere.clone()].concat();
+        self.status = None;
+        self.saving = Some(save::start(ctx, sources, save::says_one(f.clone(), name), move || {
+            let keys: &[&'static str] = if o.sources.len() == 6 { &FACE_KEYS } else { &["source"] };
+            let inputs: Vec<(&'static str, &Source)> = keys.iter().copied().zip(&o.sources).collect();
+            vec![(MapKind::Cube, Planned { path, bytes: cube_png(&out.cube, &inputs, &settings) })]
+        }));
     }
 }

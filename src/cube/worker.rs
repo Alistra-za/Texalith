@@ -168,7 +168,9 @@ mod tests {
         });
         let o = panorama();
         tx.send(job(1, &o, 0.0)).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(30)).expect("output 1").id, 1);
+        let first = rx.recv_timeout(Duration::from_secs(30)).expect("output 1");
+        assert_eq!(first.id, 1);
+        assert!(first.preview.is_some(), "the thread packs the preview's maps, so the window's thread does not");
         tx.send(job(2, &o, 0.0)).unwrap();
         tx.send(job(3, &o, 0.0)).unwrap();
         drop(gate_tx);

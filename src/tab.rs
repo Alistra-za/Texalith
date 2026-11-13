@@ -6,7 +6,7 @@ use crate::from_normal::open::{open, Opened};
 use crate::from_normal::settings::{fade_pct, Settings, PRESETS};
 use crate::from_normal::worker::{Job, Outputs, Reply};
 use crate::marker::MapKind;
-use crate::save::{self, Review};
+use crate::save::{self, Review, Saving};
 use crate::settle::{self, Settle};
 use crate::view2d;
 use eframe::egui;
@@ -75,12 +75,16 @@ pub struct Tab {
     last_draft: bool,
     /// A slider whose drags send drafts is held this frame.
     dragging: bool,
-    opening: Option<Receiver<Result<Opened, String>>>,
+    opening: Option<(PathBuf, Receiver<Result<Opened, String>>)>,
     compare_tex: Option<(u64, [egui::TextureHandle; 3])>,
     /// The section thumbnails of the outputs with this id.
     thumbs: Option<(u64, HashMap<MapKind, egui::TextureHandle>)>,
     /// A Save waiting on the overwrite dialog.
     pub review: Option<Review>,
+    /// A Save encoding or writing on its thread.
+    pub saving: Option<Saving>,
+    /// The files open in the other tabs, set by the app: Save keeps them as it keeps its own source.
+    pub elsewhere: Vec<PathBuf>,
 }
 
 /// One slider row's fixed parts. `scale` maps the stored value to the shown one (0.9 → 90 %).
@@ -188,7 +192,9 @@ pub(crate) fn slider_row_named(ui: &mut egui::Ui, r: &Row, v: &mut f32, named: &
                     .logarithmic(r.log)
                     .suffix(r.suffix)
                     .max_decimals(r.decimals)
-                    .clamping(egui::SliderClamping::Always),
+                    // Not `Always`: that writes the value back rounded to `decimals` on every frame, so a value set
+                    // from outside the slider (Match the normal, a marker's depth) would lose its digits.
+                    .clamping(egui::SliderClamping::Edits),
             );
             s.widget_info(|| egui::WidgetInfo::slider(true, f64::from(shown), named));
             let b = ui.small_button("↺").on_hover_text(&reset_name);
@@ -260,11 +266,6 @@ fn thumb_box(ui: &mut egui::Ui, name: &str, tex: Option<&egui::TextureHandle>) {
     r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, &label));
 }
 
-fn gray_image(g: &crate::from_normal::maps::Gray) -> egui::ColorImage {
-    let px: Vec<u8> = g.px.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
-    egui::ColorImage::from_gray([g.width as usize, g.height as usize], &px)
-}
-
 impl Tab {
     pub fn new(jobs: Sender<Job>, replies: Receiver<Reply>) -> Tab {
         Tab {
@@ -288,6 +289,8 @@ impl Tab {
             compare_tex: None,
             thumbs: None,
             review: None,
+            saving: None,
+            elsewhere: vec![],
         }
     }
 
@@ -296,11 +299,9 @@ impl Tab {
         self.settings = Some(Settings::for_source(&o.kind, (o.img.width, o.img.height)));
         self.folder = o.path.parent().map(PathBuf::from);
         self.outputs = None;
-        self.status = None;
         self.compare_tex = None;
         self.thumbs = None;
-        // A dialog for the old file would write its rows checked against the new source.
-        self.review = None;
+        // A running save is left to finish: it reports, or asks, when it is done, and Save stays off until then.
         self.opened = Some(o);
         self.submit(false);
     }
@@ -363,18 +364,23 @@ impl Tab {
         self.running
     }
 
-    fn start_open(&mut self, path: PathBuf, ctx: &egui::Context) {
+    /// Reads `path` on a thread; `poll_open` takes it when it has arrived.
+    pub fn start_open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        // The pick closes the old file's dialog and status line, not the arrival: a running save may ask or report
+        // while the file is read, and that answer is not the old file's dialog.
+        (self.review, self.status) = (None, None);
         let (tx, rx) = channel();
         let ctx = ctx.clone();
+        let file = path.clone();
         std::thread::spawn(move || {
             let _ = tx.send(open(&path));
             ctx.request_repaint();
         });
-        self.opening = Some(rx);
+        self.opening = Some((file, rx));
     }
 
     fn poll_open(&mut self) {
-        let Some(rx) = &self.opening else { return };
+        let Some((_, rx)) = &self.opening else { return };
         match rx.try_recv() {
             Ok(Ok(o)) => {
                 self.opening = None;
@@ -391,6 +397,7 @@ impl Tab {
 
     pub fn draw_column(&mut self, ui: &mut egui::Ui) {
         self.poll_open();
+        save::poll(&mut self.saving, &mut self.review, &mut self.status);
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
         if let Some(p) = dropped {
             self.start_open(p, ui.ctx());
@@ -428,13 +435,16 @@ impl Tab {
         if settle::due(ui, &mut self.settle, pending, &self.settings) {
             self.submit(self.dragging);
         } else if pending {
-            if let Some(c) = self.cancel.take() {
+            // Only a job still running: a finished one's result is on screen, and stays right if the value comes back.
+            if let (true, Some(c)) = (self.running, self.cancel.take()) {
                 // The running job is for older settings, and its result would land in the middle of the drag. With
                 // `sent` empty a job follows even when the slider comes back to the value that job had.
                 c.store(true, Ordering::Relaxed);
                 self.sent = None;
                 // The thread may be past its last cancel check and still answer: no reply has this id.
                 self.jobs_sent += 1;
+                // Its progress is not the next job's.
+                self.progress = None;
             }
         } else if self.last_draft && !self.dragging {
             self.submit(false);
@@ -458,7 +468,7 @@ impl Tab {
             });
         }
         if let Some(o) = &self.opened {
-            let name = o.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = crate::export::file_name(&o.path);
             ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate())
                 .on_hover_text(o.path.display().to_string());
             let kind = match o.kind {
@@ -568,9 +578,10 @@ impl Tab {
                 let ready = on
                     && !self.running
                     && self.folder.is_some()
+                    && self.saving.is_none()
                     && self.outputs.as_ref().is_some_and(|o| !o.draft && view2d::made(o, kind));
                 if ui.add_enabled(ready, egui::Button::new(format!("Save {name}"))).clicked() {
-                    self.save(Some(kind));
+                    self.save(Some(kind), ui.ctx());
                 }
             } else {
                 line(ui, &format!("Tick {name} to make this map."));
@@ -671,7 +682,7 @@ impl Tab {
         };
         if self.compare_tex.as_ref().is_none_or(|(id, _)| *id != out.id) {
             let t = |i: usize| {
-                ui.ctx().load_texture(format!("compare-{i}"), gray_image(&three[i]), egui::TextureOptions::LINEAR)
+                ui.ctx().load_texture(format!("compare-{i}"), view2d::gray_image(&three[i]), egui::TextureOptions::LINEAR)
             };
             self.compare_tex = Some((out.id, [t(0), t(1), t(2)]));
         }
@@ -908,14 +919,21 @@ impl Tab {
     fn save_rows(&mut self, ui: &mut egui::Ui) {
         folder_row(ui, &mut self.folder);
         let n = self.ticked();
-        let ready = self.outputs.as_ref().is_some_and(|o| !o.draft) && !self.running && n > 0 && self.folder.is_some();
+        let ready = self.outputs.as_ref().is_some_and(|o| !o.draft)
+            && !self.running
+            && n > 0
+            && self.folder.is_some()
+            && self.saving.is_none();
         let label = match (self.outputs.is_some(), n) {
             (true, 1) => "Save 1 map".to_string(),
             (true, n) if n > 0 => format!("Save {n} maps"),
             _ => "Save".to_string(),
         };
         if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
-            self.save(None);
+            self.save(None, ui.ctx());
+        }
+        if self.saving.is_some() {
+            save::saving_row(ui);
         }
         match &self.status {
             Some(Ok(m)) => line(ui, m),
@@ -924,32 +942,24 @@ impl Tab {
         }
     }
 
-    /// Saves every ticked map, or only the map of kind `only`. Writes at once when nothing on disk needs a choice;
-    /// otherwise opens the dialog.
-    // shortcut: plan, review and write run on the UI thread (PNG encode, hashes, reads); move them to a thread with a
-    // spinner, as start_open does, if saving at 4096 freezes the window.
-    fn save(&mut self, only: Option<MapKind>) {
+    /// The files this tab has open, with one still being read.
+    pub fn open_files(&self) -> Vec<PathBuf> {
+        self.opened.iter().map(|o| &o.path).chain(self.opening.iter().map(|(p, _)| p)).cloned().collect()
+    }
+
+    /// Saves every ticked map, or only the map of kind `only`, on a thread (`save::start`). The files are written at
+    /// once when nothing on disk needs a choice; otherwise the dialog opens when the thread answers.
+    fn save(&mut self, only: Option<MapKind>, ctx: &egui::Context) {
         let (Some(o), Some(s), Some(out), Some(f)) = (&self.opened, &self.settings, &self.outputs, &self.folder) else {
             return;
         };
-        let mut plan = save::plan(o, s, out, f);
-        plan.retain(|(k, _)| only.is_none_or(|only| *k == only));
-        let r = save::review(plan, &o.path);
-        match r.needs_dialog() {
-            true => self.review = Some(r),
-            false => self.write(&r),
-        }
-    }
-
-    /// All or nothing; an `Err` names the failing file and says nothing was changed (export::write rolls back).
-    fn write(&mut self, r: &Review) {
-        let (Some(o), Some(f)) = (&self.opened, &self.folder) else { return };
-        let kept = r.kept();
-        self.status = Some(r.write(&o.path).map(|written| match written.len() {
-            0 if kept > 0 => format!("Nothing saved: the files in {} were kept", f.display()),
-            0 => format!("Nothing to save: the files in {} already match", f.display()),
-            1 => format!("Saved 1 map to {}", f.display()),
-            n => format!("Saved {n} maps to {}", f.display()),
+        let (o, s, out, f) = (o.clone(), s.clone(), out.clone(), f.clone());
+        let sources = [self.open_files(), self.elsewhere.clone()].concat();
+        self.status = None;
+        self.saving = Some(save::start(ctx, sources, says(f.clone()), move || {
+            let mut plan = save::plan(&o, &s, &out, &f);
+            plan.retain(|(k, _)| only.is_none_or(|only| *k == only));
+            plan
         }));
     }
 
@@ -958,12 +968,23 @@ impl Tab {
         match save::dialog(ctx, r) {
             Some(true) => {
                 let r = self.review.take().expect("the dialog is open");
-                self.write(&r);
+                // All or nothing; an `Err` names the failing file and says nothing was changed.
+                self.saving = Some(save::start_write(ctx, r, [self.open_files(), self.elsewhere.clone()].concat()));
             }
             Some(false) => self.review = None,
             None => {}
         }
     }
+}
+
+/// The status line after a write into `f`.
+fn says(f: PathBuf) -> save::Say {
+    Box::new(move |written, kept| match written {
+        0 if kept > 0 => format!("Nothing saved: the files in {} were kept", f.display()),
+        0 => format!("Nothing to save: the files in {} already match", f.display()),
+        1 => format!("Saved 1 map to {}", f.display()),
+        n => format!("Saved {n} maps to {}", f.display()),
+    })
 }
 
 fn surface_depth_row(name: &str) -> Row<'_> {

@@ -14,10 +14,11 @@ use engine::ops::linear_to_game_gamma;
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
-/// `<stem>_e.png`: a face tag is dropped, and a stem that already ends in `_e` (any case) is kept as it is.
-pub fn out_name(first_source: &Path) -> String {
+/// `<stem>_e.png`: the face tag of six `faces` files is dropped (a picture opened alone keeps its whole name), and
+/// a stem that already ends in `_e` (any case) is kept as it is.
+pub fn out_name(first_source: &Path, faces: bool) -> String {
     let stem = first_source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let stem = face_tag(&stem).map_or(stem.as_str(), |(s, _)| s);
+    let stem = face_tag(&stem).filter(|_| faces).map_or(stem.as_str(), |(s, _)| s);
     if stem.to_ascii_lowercase().ends_with("_e") {
         format!("{stem}.png")
     } else {
@@ -86,11 +87,12 @@ mod tests {
 
     #[test]
     fn output_names_end_in_e() {
-        assert_eq!(out_name(Path::new("C:/in/sky.hdr")), "sky_e.png");
-        assert_eq!(out_name(Path::new("C:/in/room_posx.png")), "room_e.png");
-        assert_eq!(out_name(Path::new("C:/in/room_PX.png")), "room_e.png");
-        assert_eq!(out_name(Path::new("C:/in/chrome_e.png")), "chrome_e.png");
-        assert_eq!(out_name(Path::new("C:/in/chrome_E.png")), "chrome_E.png");
+        assert_eq!(out_name(Path::new("C:/in/sky.hdr"), false), "sky_e.png");
+        assert_eq!(out_name(Path::new("C:/in/room_posx.png"), true), "room_e.png");
+        assert_eq!(out_name(Path::new("C:/in/room_PX.png"), true), "room_e.png");
+        assert_eq!(out_name(Path::new("C:/in/city_ny.hdr"), false), "city_ny_e.png");
+        assert_eq!(out_name(Path::new("C:/in/chrome_e.png"), false), "chrome_e.png");
+        assert_eq!(out_name(Path::new("C:/in/chrome_E.png"), false), "chrome_E.png");
     }
 
     #[test]

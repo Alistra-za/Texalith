@@ -29,7 +29,7 @@ pub fn name(k: MapKind) -> &'static str {
     }
 }
 
-fn gray_image(g: &Gray) -> egui::ColorImage {
+pub(crate) fn gray_image(g: &Gray) -> egui::ColorImage {
     let px: Vec<u8> = g.px.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
     egui::ColorImage::from_gray([g.width as usize, g.height as usize], &px)
 }
@@ -92,11 +92,15 @@ pub fn thumb(out: &Outputs, k: MapKind) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_gray(size, &px))
 }
 
-/// An RGB image of stored texels (0..1), alpha dropped.
+/// An RGB image of stored texels (0..1), alpha dropped. A side over the 3D preview's `PREVIEW_MAX` is cut to it by
+/// taking every k-th texel: the screen shows no more, and an 8192 texture costs the window's thread half a gigabyte.
 pub fn rgb_image(size: (u32, u32), px: &[[f32; 4]]) -> egui::ColorImage {
     let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let px: Vec<u8> = px.iter().flat_map(|p| [byte(p[0]), byte(p[1]), byte(p[2])]).collect();
-    egui::ColorImage::from_rgb([size.0 as usize, size.1 as usize], &px)
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    let k = w.max(h).div_ceil(crate::preview_maps::PREVIEW_MAX as usize).max(1);
+    let at = (0..h).step_by(k).flat_map(|y| (0..w).step_by(k).map(move |x| px[y * w + x]));
+    let pixels = at.map(|p| egui::Color32::from_rgb(byte(p[0]), byte(p[1]), byte(p[2]))).collect();
+    egui::ColorImage::new([w.div_ceil(k), h.div_ceil(k)], pixels)
 }
 
 /// A "Map" combo over `maps` (at least one), a "Repeat 2x2" tick, then the map from `image`. `textures` holds one
@@ -133,5 +137,23 @@ pub fn draw(
         let min = whole.min + egui::vec2((i % n) as f32 * cell.x, (i / n) as f32 * cell.y);
         let r = ui.put(egui::Rect::from_min_size(min, cell), egui::Image::new(&*tex).fit_to_exact_size(cell));
         r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, name(v.map)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_image_over_the_preview_size_is_cut_to_it() {
+        // 8192 wide: every second texel, as the 3D preview's map is halved.
+        let px: Vec<[f32; 4]> = (0..8192 * 2).map(|i| [if i % 2 == 0 { 1.0 } else { 0.0 }, 0.5, 0.0, 1.0]).collect();
+        let img = rgb_image((8192, 2), &px);
+        assert_eq!(img.size, [4096, 1]);
+        assert!(img.pixels.iter().all(|c| *c == egui::Color32::from_rgb(255, 128, 0)), "the even texels of the first row");
+        // At the preview size nothing is dropped.
+        let small = rgb_image((4096, 2), &px[..4096 * 2]);
+        assert_eq!(small.size, [4096, 2]);
+        assert_eq!(small.pixels[1], egui::Color32::from_rgb(0, 128, 0));
     }
 }

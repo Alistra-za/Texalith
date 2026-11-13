@@ -1,6 +1,7 @@
 //! Opening a cube source: one picture, or six face files found together from any one of them.
 use super::import::{detect, face_tag, UNEQUAL};
 use super::SourceType;
+use crate::export::file_name;
 use crate::from_normal::files::{source, Source};
 use engine::image::Rgba32F;
 use engine::ops::game_gamma_to_linear;
@@ -22,16 +23,27 @@ pub struct Opened {
 pub fn fit(mut img: Rgba32F) -> Rgba32F {
     while img.width > MAX_SIDE || img.height > MAX_SIDE {
         let size = ((img.width / 2).max(1), (img.height / 2).max(1));
-        img = crate::resample::resample(img, size);
+        img = crate::resample::resample(&img, size).into_owned();
     }
     img
 }
 
-fn file_name(p: &Path) -> String {
-    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+/// What an infinite texel (a clipped sun) becomes: far above any real light, and small enough that the blur and the
+/// tone maths cannot overflow on it.
+pub(crate) const SUN: f32 = 1e12;
+
+/// A float file's light made usable: NaN and negative values become 0 and infinity becomes `SUN`.
+fn finite(img: &mut Rgba32F) {
+    for p in &mut img.px {
+        for v in &mut p[..3] {
+            // A NaN is not above 0, so it becomes 0 too.
+            *v = if *v > 0.0 { v.min(SUN) } else { 0.0 };
+        }
+    }
 }
 
-/// `path` hashed and decoded to linear light: 8- and 16-bit codes through the game gamma, float files as they are.
+/// `path` hashed and decoded to linear light: 8- and 16-bit codes through the game gamma, float files as they are
+/// apart from `finite`.
 fn load(path: &Path) -> Result<(Source, Arc<Rgba32F>), String> {
     let fail = |e: &dyn std::fmt::Display| format!("Could not read {}: {e}", file_name(path));
     let src = source(path).map_err(|e| fail(&e))?;
@@ -42,18 +54,23 @@ fn load(path: &Path) -> Result<(Source, Arc<Rgba32F>), String> {
                 *v = game_gamma_to_linear(*v);
             }
         }
+    } else {
+        // Before `fit`, whose resample would spread one bad texel over its neighbours.
+        finite(&mut img);
     }
     Ok((src, Arc::new(fit(img))))
 }
 
-/// `path` opened. A name with a face tag (`_posx`, `_nz`, ...) opens all six face files beside it.
+/// `path` opened. A name with a face tag (`_posx`, `_nz`, ...) opens all six face files beside it; with no other
+/// face of its set there, it is one picture whose name happens to end that way (`times_square_ny.hdr`).
 pub fn open(path: &Path) -> Result<Opened, String> {
-    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let Some((base, _)) = face_tag(&stem) else {
+    let single = || {
         let (src, img) = load(path)?;
         let detected = detect(&img);
-        return Ok(Opened { sources: vec![src], imgs: vec![img], detected });
+        Ok(Opened { sources: vec![src], imgs: vec![img], detected })
     };
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let Some((base, _)) = face_tag(&stem) else { return single() };
     let dir = path.parent().unwrap_or(Path::new("."));
     let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
     let long = stem.len() - base.len() == 5;
@@ -73,6 +90,9 @@ pub fn open(path: &Path) -> Result<Opened, String> {
     let tags = if long { ["posx", "negx", "posy", "negy", "posz", "negz"] } else { ["px", "nx", "py", "ny", "pz", "nz"] };
     let missing: Vec<String> =
         (0..6).filter(|&k| found[k].is_none()).map(|k| format!("{base}_{}.{ext}", tags[k])).collect();
+    if missing.len() == 5 {
+        return single();
+    }
     if !missing.is_empty() {
         return Err(format!("{} is one of six face files, but {} is missing.", file_name(path), missing.join(", ")));
     }
@@ -113,6 +133,29 @@ mod tests {
     }
 
     const TAGS: [&str; 6] = ["posx", "negx", "posy", "negy", "posz", "negz"];
+
+    #[test]
+    fn infinite_nan_and_negative_light_is_made_usable() {
+        let mut img = Rgba32F::new(2, 1, [0.25, 0.5, 2.0, 1.0]);
+        img.px[0] = [f32::INFINITY, f32::NAN, -3.0, 1.0];
+        finite(&mut img);
+        assert_eq!(img.px[0], [SUN, 0.0, 0.0, 1.0]);
+        assert_eq!(img.px[1], [0.25, 0.5, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn a_float_file_with_a_clipped_sun_opens_with_usable_light() {
+        let d = folder("exr-sun");
+        let p = d.join("sky.exr");
+        let mut img = image::Rgb32FImage::from_pixel(8, 4, image::Rgb([0.25, 0.5, 2.0]));
+        img.put_pixel(3, 1, image::Rgb([f32::INFINITY, f32::NAN, -3.0]));
+        img.save(&p).unwrap();
+        let o = open(&p).unwrap();
+        let px = &o.imgs[0].px;
+        assert!(px.iter().all(|t| t[..3].iter().all(|v| v.is_finite() && *v >= 0.0)), "{:?}", px[8 + 3]);
+        assert_eq!(px[8 + 3][..3], [SUN, 0.0, 0.0]);
+        assert_eq!(px[0][..3], [0.25, 0.5, 2.0]);
+    }
 
     #[test]
     fn an_8_bit_source_is_decoded_with_game_gamma() {
@@ -161,5 +204,17 @@ mod tests {
         }
         let e = open(&d.join("room_negy.png")).err().unwrap();
         assert_eq!(e, "room_negy.png is one of six face files, but room_posz.png is missing.");
+    }
+
+    #[test]
+    fn a_lone_picture_whose_name_ends_like_a_face_opens_as_one_picture() {
+        let d = folder("lone");
+        let p = d.join("times_square_ny.png");
+        png8(&p, 8, 4, 100);
+        // Another picture beside it that is no face of the same set.
+        png8(&d.join("harbour.png"), 8, 4, 100);
+        let o = open(&p).unwrap();
+        assert_eq!(o.sources.len(), 1);
+        assert_eq!(o.detected, Some(SourceType::Panorama));
     }
 }

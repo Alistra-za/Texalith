@@ -79,6 +79,29 @@ fn open(h: &mut Harness<'_, RnmTab>, p: &Path) {
 fn press(h: &mut Harness<'_, RnmTab>, label: &str) {
     h.get_by_role_and_label(Role::Button, label).click_accesskit();
     h.run_steps(2);
+    saved(h);
+}
+
+/// Steps until the running save has finished and its result is shown.
+fn saved(h: &mut Harness<'_, RnmTab>) {
+    let start = std::time::Instant::now();
+    while h.state().saving.is_some() {
+        assert!(start.elapsed().as_secs() < 300, "the save never finished");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+}
+
+/// A save that waits for the returned sender, then has nothing to write.
+fn held_save(ctx: &egui::Context) -> (std::sync::mpsc::Sender<()>, texalith::save::Saving) {
+    let (gate, wait) = std::sync::mpsc::channel();
+    let say = Box::new(|w, k| format!("{w} written, {k} kept"));
+    let s = texalith::save::start(ctx, vec![], say, move || {
+        let _ = wait.recv();
+        vec![]
+    });
+    (gate, s)
 }
 
 fn shown(h: &Harness<'_, RnmTab>, text: &str) -> bool {
@@ -398,9 +421,15 @@ fn an_8192_base_blends_and_saves() {
     h.state_mut().folder = Some(out.clone());
     h.run_steps(2);
     press(&mut h, "Save");
+    let written = start.elapsed();
     let saved = std::fs::read(out.join("big_n.png")).expect("the saved blend");
     assert!(marker::is_ours(&saved));
-    eprintln!("8192: open and blend {blended:.1?}, with save {:.1?}, file {} MB", start.elapsed(), saved.len() >> 20);
+    eprintln!(
+        "8192: open and blend {blended:.1?}, save {:.1?}, read back and checked at {:.1?}, file {} MB",
+        written - blended,
+        start.elapsed(),
+        saved.len() >> 20
+    );
 }
 
 #[test]
@@ -604,6 +633,7 @@ fn keeping_the_foreign_file_says_nothing_was_saved() {
         .unwrap()
         .click_accesskit();
     h.run_steps(2);
+    saved(&mut h);
     assert_eq!(std::fs::read(&foreign).unwrap(), before);
     match &h.state().status {
         Some(Ok(m)) => assert!(m.starts_with("Nothing saved: rock_n.png was kept"), "{m}"),
@@ -849,4 +879,235 @@ fn the_font_has_every_symbol_the_column_draws() {
     for g in texalith::rnm::tab::GLYPHS {
         assert!(h.ctx.fonts_mut(|f| f.has_glyphs(&font, g)), "{g} would draw as an empty box");
     }
+}
+
+#[test]
+fn a_mask_cleared_while_it_loads_stays_cleared() {
+    let d = temp("clear-loading");
+    let mut h = rig();
+    open(&mut h, &base(&d, "rock_n.png"));
+    let uid = add(&mut h, Kind::Detail, &layer(&d, "rock_detail.png"));
+    let slot = Slot { layer: uid, part: Part::Mask };
+    let ctx = h.ctx.clone();
+    h.state_mut().fill(slot, layer(&d, "mask.png"), &ctx);
+    h.state_mut().clear(slot);
+    settle(&mut h);
+    assert!(h.state().layers[0].mask.is_none(), "the cleared mask came back when its file finished loading");
+}
+
+#[test]
+fn the_last_file_chosen_for_a_slot_wins_over_a_slower_earlier_one() {
+    let d = temp("choose-twice");
+    let mut h = rig();
+    open(&mut h, &base(&d, "rock_n.png"));
+    let uid = add(&mut h, Kind::Detail, &layer(&d, "rock_detail.png"));
+    // Large, so it is still being read when the small one lands.
+    let slow = d.join("slow.png");
+    image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_fn(2048, 2048, |x, y| image::Rgba([(x * 31) as u16, (y * 17) as u16, 60000, 65535]))
+        .save(&slow)
+        .unwrap();
+    let slot = Slot { layer: uid, part: Part::File };
+    let ctx = h.ctx.clone();
+    h.state_mut().fill(slot, slow, &ctx);
+    h.state_mut().fill(slot, layer(&d, "fast.png"), &ctx);
+    settle(&mut h);
+    let file = h.state().layers[0].file.as_ref().map(|l| l.source.path.file_name().unwrap().to_owned());
+    assert_eq!(file.as_deref(), Some(std::ffi::OsStr::new("fast.png")));
+}
+
+#[test]
+fn a_value_that_comes_back_after_its_result_was_dropped_is_sent_again() {
+    let d = temp("back");
+    let b = base(&d, "rock_n.png");
+    layer(&d, "rock_bump.png");
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
+    let (_out_tx, out_rx) = std::sync::mpsc::channel();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+        |ui, tab: &mut RnmTab| {
+            tab.drain();
+            egui::Panel::left("column").resizable(false).exact_size(COLUMN_WIDTH).show(ui, |ui| tab.draw_column(ui));
+        },
+        RnmTab::new(job_tx, out_rx),
+    );
+    let ctx = h.ctx.clone();
+    h.state_mut().open_base(b, &ctx);
+    for _ in 0..500 {
+        h.run_steps(1);
+        if !h.state().busy() && h.state().layers.iter().any(|l| l.file.is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.run_steps(2);
+    let running = h.state().jobs_sent;
+    assert!(running > 0 && job_rx.try_iter().count() > 0, "a job is out and has no result yet");
+    let was = h.state().layers[0].set.strength;
+    // The button is held (on nothing), so a changed value waits and the running job's result is dropped.
+    let held = egui::pos2(900.0, 450.0);
+    h.drag_at(held);
+    h.step();
+    h.state_mut().layers[0].set.strength = was * 0.5;
+    h.run_steps(2);
+    h.state_mut().layers[0].set.strength = was;
+    h.step();
+    h.drop_at(held);
+    h.run_steps(2);
+    assert_eq!(h.state().jobs_sent, running + 1, "the dropped result's value is sent again");
+}
+
+#[test]
+fn save_is_off_while_a_save_runs() {
+    let d = temp("saving");
+    let b = base(&d, "rock_n.png");
+    let mut h = rig();
+    open(&mut h, &b);
+    let off = |h: &Harness<'_, RnmTab>| h.get_by_role_and_label(Role::Button, "Save").accesskit_node().is_disabled();
+    assert!(!off(&h));
+    let (gate, saving) = held_save(&h.ctx);
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    assert!(off(&h) && shown(&h, "Saving…"));
+    // A new base while it runs: the save still answers, and Save stays off until it has.
+    open(&mut h, &base(&d, "other_n.png"));
+    assert!(h.state().saving.is_some() && off(&h));
+    gate.send(()).unwrap();
+    saved(&mut h);
+    assert_eq!(h.state().status, Some(Ok("0 written, 0 kept".into())));
+    assert!(!off(&h));
+}
+
+#[test]
+fn a_name_open_in_another_tab_is_passed_over() {
+    let d = temp("elsewhere-name");
+    let b = base(&d, "rock_n.png");
+    let mut h = rig();
+    open(&mut h, &b);
+    // rock_n1.png is open as the Material tab's source.
+    let other = layer(&d, "rock_n1.png");
+    let before = std::fs::read(&other).unwrap();
+    h.state_mut().elsewhere = vec![other.clone()];
+    h.run_steps(2);
+    press(&mut h, "Save");
+    assert!(d.join("rock_n2.png").is_file(), "status {:?}", h.state().status);
+    assert_eq!(std::fs::read(&other).unwrap(), before);
+}
+
+#[test]
+fn a_file_over_8192_is_refused_from_its_header() {
+    let d = temp("oversize");
+    let big = d.join("big_detail.png");
+    image::GrayImage::new(8193, 1).save(&big).unwrap();
+    // Pixel data that cannot be decoded: only a reader that stopped at the header can name the size.
+    let mut bytes = std::fs::read(&big).unwrap();
+    let idat = bytes.windows(4).position(|w| w == b"IDAT").unwrap();
+    bytes[idat + 4..idat + 12].iter_mut().for_each(|b| *b ^= 0xff);
+    std::fs::write(&big, bytes).unwrap();
+    const WHY: &str = "big_detail.png is 8193x1; the largest RNM output is 8192, so resize it first.";
+    let mut h = rig();
+    open(&mut h, &big);
+    assert_eq!(h.state().status, Some(Err(WHY.into())));
+    assert!(h.state().base.is_none());
+    // A layer, a mask or an AO map that large is never needed either: the blend is at most 8192.
+    open(&mut h, &base(&d, "rock_n.png"));
+    let uid = add(&mut h, Kind::Detail, &big);
+    assert_eq!(h.state().status, Some(Err(WHY.into())));
+    assert!(h.state().layers.iter().find(|l| l.uid == uid).unwrap().file.is_none());
+}
+
+#[test]
+fn a_mask_and_an_ao_map_keep_one_channel() {
+    let d = temp("planes");
+    let b = base(&d, "rock_n.png");
+    let f = layer(&d, "bent.png");
+    let m = png(&d, "m.png", |x, _| [x as f32 / 15.0, 0.9, 0.8, 0.7]);
+    let mut h = rig();
+    open(&mut h, &b);
+    let uid = add(&mut h, Kind::Bent, &f);
+    let ctx = h.ctx.clone();
+    h.state_mut().fill(Slot { layer: uid, part: Part::Mask }, m.clone(), &ctx);
+    h.state_mut().fill(Slot { layer: uid, part: Part::Ao }, m, &ctx);
+    settle(&mut h);
+    let l = &h.state().layers[0];
+    for plane in [l.mask.as_ref().unwrap(), l.ao.as_ref().unwrap()] {
+        // The red channel only: a quarter of the memory of the four channels the file holds.
+        let px: &Vec<f32> = &plane.img.px;
+        assert_eq!(px.len(), 256);
+        assert!((px[15] - 1.0).abs() < 1e-4 && px[0] == 0.0, "red, not green or blue");
+    }
+}
+
+#[test]
+fn a_file_still_being_read_already_counts_as_open() {
+    // Another tab's Save asks for this list: a file picked here must be kept before its pixels have arrived.
+    let d = temp("opening");
+    let b = base(&d, "rock_n.png");
+    let mut h = rig();
+    let ctx = h.ctx.clone();
+    h.state_mut().open_base(b.clone(), &ctx);
+    assert_eq!(h.state().open_files(), vec![b.clone()]);
+    settle(&mut h);
+    assert_eq!(h.state().open_files(), vec![b.clone()], "and once only when it has arrived");
+    let uid = h.state_mut().add_layer(Kind::Detail, &ctx);
+    let f = layer(&d, "late_detail.png");
+    h.state_mut().fill(Slot { layer: uid, part: Part::File }, f.clone(), &ctx);
+    assert_eq!(h.state().open_files(), vec![b, f]);
+}
+
+#[test]
+fn a_question_is_not_closed_by_the_arrival_of_a_base_picked_before_it() {
+    let d = temp("saving-pick");
+    let mut h = rig();
+    open(&mut h, &base(&d, "rock_n.png"));
+    let path = d.join("taken.png");
+    std::fs::write(&path, b"someone else's file").unwrap();
+    let (gate, wait) = std::sync::mpsc::channel::<()>();
+    let saving = texalith::save::start(&h.ctx, vec![], Box::new(|w, k| format!("{w} written, {k} kept")), move || {
+        let _ = wait.recv();
+        vec![(MapKind::Rnm, texalith::export::Planned { path, bytes: vec![1, 2, 3] })]
+    });
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    // The pick, then the save's question, then the new base's arrival: all three before the next frame.
+    let ctx = h.ctx.clone();
+    h.state_mut().open_base(base(&d, "other_n.png"), &ctx);
+    gate.send(()).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    settle(&mut h);
+    assert!(shown(&h, "Some files will be kept"), "the question is still there to answer");
+}
+
+#[test]
+fn a_save_line_is_not_wiped_by_the_arrival_of_a_base_picked_before_it() {
+    let d = temp("saving-line");
+    let mut h = rig();
+    open(&mut h, &base(&d, "rock_n.png"));
+    let (gate, saving) = held_save(&h.ctx);
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    // The pick, then the save's report, then the new base's arrival: all three before the next frame.
+    let ctx = h.ctx.clone();
+    h.state_mut().open_base(base(&d, "other_n.png"), &ctx);
+    gate.send(()).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    settle(&mut h);
+    assert_eq!(h.state().status, Some(Ok("0 written, 0 kept".into())));
+}
+
+#[test]
+fn picking_another_base_closes_the_dialog_and_the_status_line() {
+    let d = temp("pick-closes");
+    let mut h = rig();
+    open(&mut h, &base(&d, "rock_n.png"));
+    let path = d.join("taken.png");
+    std::fs::write(&path, b"someone else's file").unwrap();
+    let saving = texalith::save::start(&h.ctx, vec![], Box::new(|w, k| format!("{w} written, {k} kept")), move || {
+        vec![(MapKind::Rnm, texalith::export::Planned { path, bytes: vec![1, 2, 3] })]
+    });
+    h.state_mut().saving = Some(saving);
+    saved(&mut h);
+    assert!(shown(&h, "Some files will be kept"));
+    h.state_mut().status = Some(Err("a line about the old base".into()));
+    let ctx = h.ctx.clone();
+    h.state_mut().open_base(base(&d, "other_n.png"), &ctx);
+    assert!(h.state().review.is_none() && h.state().status.is_none());
 }

@@ -6,6 +6,7 @@ use engine::cube::world::to_world;
 use engine::cube::{dir_at, Cube};
 use engine::image::Rgba32F;
 use rayon::prelude::*;
+use std::borrow::Cow;
 
 /// (col, row) of each face's cell, +X..-Z. A horizontal cross is 4x3 cells, a vertical one 3x4.
 pub const HCROSS: [(u32, u32); 6] = [(2, 1), (0, 1), (1, 0), (1, 2), (1, 1), (3, 1)];
@@ -94,10 +95,10 @@ pub fn cell(t: SourceType, w: u32, h: u32) -> u32 {
 /// face files go through `faces`.
 pub fn import(img: &Rgba32F, t: SourceType, n: u32, turn_bottom: bool) -> Cube {
     match t {
-        SourceType::Panorama => project(img, n, true, |d| dir_to_uv(d, 0.0)),
-        SourceType::Photo => import(&photo_panorama(img), SourceType::Panorama, n, false),
+        SourceType::Panorama => project(&fitted(img, t, n), n, true, |d| dir_to_uv(d, 0.0)),
+        SourceType::Photo => project(&photo_panorama(&fitted(img, t, n)), n, true, |d| dir_to_uv(d, 0.0)),
         SourceType::MirrorBall => mirror_ball(img, n),
-        SourceType::Angular => angular(img, n),
+        SourceType::Angular => angular(&fitted(img, t, n), n),
         SourceType::Faces => unreachable!("six face files go through faces()"),
         _ => {
             let (c, at) = cells(t, img.width, img.height).expect("the tab checks fits() first");
@@ -108,11 +109,24 @@ pub fn import(img: &Rgba32F, t: SourceType, n: u32, turn_bottom: bool) -> Cube {
                     if t == SourceType::VCross && k == 5 && turn_bottom {
                         face = rotate(&face, 180);
                     }
-                    crate::resample::resample(face, (n, n))
+                    crate::resample::resample(&face, (n, n)).into_owned()
                 }),
             }
         }
     }
+}
+
+/// A panorama, photo or angular map whose cell is over twice the cube's edge, shrunk to twice the edge with the area
+/// filter: `project` reads 3x3 taps per cube texel, which cover that much and no more, so a small sun keeps its
+/// light, and a photo's panorama is no larger than the cube needs. A smaller source is read as it is, and so is a
+/// mirror ball: it packs the far side of the sphere into its rim, which a shrink would blur.
+fn fitted(img: &Rgba32F, t: SourceType, n: u32) -> Cow<'_, Rgba32F> {
+    let c = cell(t, img.width, img.height);
+    if c <= 2 * n || t == SourceType::MirrorBall {
+        return Cow::Borrowed(img);
+    }
+    let side = |v: u32| ((u64::from(v) * 2 * u64::from(n) + u64::from(c) / 2) / u64::from(c)).max(1) as u32;
+    crate::resample::resample(img, (side(img.width), side(img.height)))
 }
 
 pub(crate) const UNEQUAL: &str = "The six face files are not equal squares.";
@@ -125,7 +139,7 @@ pub fn faces(imgs: [&Rgba32F; 6], n: u32) -> Result<Cube, String> {
     }
     Ok(Cube {
         size: n,
-        faces: imgs.map(|f| crate::resample::resample(f.clone(), (n, n))),
+        faces: imgs.map(|f| crate::resample::resample(f, (n, n)).into_owned()),
     })
 }
 
@@ -337,10 +351,11 @@ fn angular(img: &Rgba32F, size: u32) -> Cube {
 }
 
 /// Each cube texel is the mean of 3x3 bilinear samples over its footprint; `map` takes a world direction to the
-/// source's `(u, v)` (panorama: 0..1; disc layouts: -1..1 with v up, mapped to the image here).
+/// source's `(u, v)` (panorama: 0..1; disc layouts: -1..1 with v up, mapped to the image here). The taps cover a
+/// source cell of up to twice `size`; `import` shrinks a larger source first (`fitted`).
+// shortcut: a mirror ball far larger than the cube is not shrunk, so its 3x3 taps alias in the middle of the ball;
+// shrink it by the local stretch if a small light in a large ball flickers between sizes.
 fn project(img: &Rgba32F, size: u32, panorama: bool, map: impl Fn([f32; 3]) -> (f32, f32) + Sync) -> Cube {
-    // shortcut: fixed 3x3 taps alias when the face is far below the source cell (a large source to a small cube);
-    // scale the tap count with cell/size when that matters.
     const K: u32 = 3;
     build(size, |face, x, y| {
         let mut sum = [0.0f32; 4];
@@ -601,6 +616,39 @@ mod tests {
         assert_eq!(cell(SourceType::Photo, w, h), w / 2);
         let c = import(&img, SourceType::Photo, 16, true);
         assert!(c.faces.iter().all(|f| f.px.iter().all(|p| p[0].is_finite())));
+    }
+
+    #[test]
+    fn a_small_sun_in_a_large_panorama_is_never_missed() {
+        // 1024 source texels per cube texel: 9 taps on the full image hit a one-texel sun by luck.
+        const SUN: f32 = 1000.0;
+        for x in 256..288 {
+            let mut img = Rgba32F::new(1024, 512, [0.0, 0.0, 0.0, 1.0]);
+            *img.at_mut(x, 256) = [SUN, SUN, SUN, 1.0];
+            let c = import(&img, SourceType::Panorama, 8, true);
+            let sum: f32 = c.faces.iter().flat_map(|f| f.px.iter()).map(|p| p[0]).sum();
+            // A cube texel in the middle of a face is about 40.7 source texels wide (1024 / 2 pi * 2 / 8).
+            let want = SUN / (40.7 * 40.7);
+            assert!(sum > want / 2.0 && sum < want * 2.0, "sun at x {x}: {sum} vs {want}");
+        }
+    }
+
+    #[test]
+    fn only_a_source_far_larger_than_the_cube_is_shrunk() {
+        // At up to twice the cube's edge the image is read as it is, so the mapping tests stay exact.
+        let small = sized(256, 128);
+        assert!(matches!(fitted(&small, SourceType::Panorama, 32), Cow::Borrowed(_)));
+        let big = sized(1024, 512);
+        let f = fitted(&big, SourceType::Panorama, 8);
+        assert_eq!((f.width, f.height), (64, 32));
+        // A mirror ball packs the far side into its rim, so it is read at its own size.
+        assert!(matches!(fitted(&big, SourceType::MirrorBall, 8), Cow::Borrowed(_)));
+        // A photo keeps its shape: its panorama is then 128 x 64, not 4096 x 2048.
+        let photo = sized(2048, 1365);
+        let f = fitted(&photo, SourceType::Photo, 16);
+        assert_eq!((f.width, f.height), (64, 43));
+        let c = import(&photo, SourceType::Photo, 16, true);
+        assert!(c.faces.iter().all(|f| f.px.iter().all(|p| *p == GREY)));
     }
 
     #[test]

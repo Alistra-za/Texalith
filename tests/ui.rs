@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use texalith::from_normal::files::Source;
 use texalith::rnm::blend::decode_base;
-use texalith::rnm::files::Loaded;
+use texalith::rnm::files::{Loaded, Plane};
 use texalith::rnm::tab::{RnmTab, OPEN_BASE};
 use texalith::rnm::{worker as rnm_worker, Kind};
 use texalith::tab::Tab;
@@ -129,10 +129,9 @@ fn pushes(cmds: &Receiver<Cmd>) -> (Vec<HashSet<&'static str>>, Vec<&'static str
 /// The RNM tab with a long-named base, a Bent layer with a mask and an AO map, and a Bump layer, in the base's
 /// own folder.
 fn rnm_filled(h: &mut Harness<'_, App>) {
-    let loaded = |name: &str| Loaded {
-        source: Source { path: PathBuf::from(format!("C:/textures/a rather long folder name/{name}")), sha256: "00".into() },
-        img: Arc::new(engine::image::Rgba32F::new(4, 4, [0.5, 0.5, 1.0, 1.0])),
-    };
+    let source = |name: &str| Source { path: PathBuf::from(format!("C:/textures/a rather long folder name/{name}")), sha256: "00".into() };
+    let loaded = |name: &str| Loaded { source: source(name), img: Arc::new(engine::image::Rgba32F::new(4, 4, [0.5, 0.5, 1.0, 1.0])) };
+    let plane = |name: &str| Plane { source: source(name), img: Arc::new(gray(0.5)) };
     let base = loaded("a_very_long_texture_set_name_for_a_rock_wall_n.png");
     let ctx = h.ctx.clone();
     let t = &mut h.state_mut().rnm;
@@ -141,8 +140,8 @@ fn rnm_filled(h: &mut Harness<'_, App>) {
     t.add_layer(Kind::Bent, &ctx);
     let l = t.layers.last_mut().unwrap();
     l.file = Some(loaded("a_very_long_texture_set_name_for_a_rock_wall_bent.png"));
-    l.mask = Some(loaded("a_very_long_texture_set_name_for_a_rock_wall_bent_mask.png"));
-    l.ao = Some(loaded("a_very_long_texture_set_name_for_a_rock_wall_ao.png"));
+    l.mask = Some(plane("a_very_long_texture_set_name_for_a_rock_wall_bent_mask.png"));
+    l.ao = Some(plane("a_very_long_texture_set_name_for_a_rock_wall_ao.png"));
     t.add_layer(Kind::Bump, &ctx);
     t.layers.last_mut().unwrap().file = Some(loaded("a_very_long_texture_set_name_for_a_rock_wall_bump.png"));
 }
@@ -690,4 +689,81 @@ fn a_white_parallax_map_is_previewed_as_white() {
     assert!(sent.iter().any(|c| matches!(c, Cmd::SetWhite(false))));
     assert!(!sent.iter().any(|c| matches!(c, Cmd::SetContent(_))));
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_cleared_tab_shows_the_flat_ball_not_the_last_files_maps() {
+    let (mut h, rig) = rig((1280.0, 800.0));
+    h.run_steps(2);
+    tab_button(&mut h, "RNM");
+    deliver_rnm(&mut h, &rig, 1, 0.5);
+    let _ = pushes(&rig.cmds);
+    // What opening another base does before its first blend lands.
+    h.state_mut().rnm.outputs = None;
+    h.run_steps(3);
+    let (sets, swaps) = pushes(&rig.cmds);
+    assert_eq!(sets, vec![HashSet::new()], "one reload with no maps, and not one per frame");
+    assert!(swaps.is_empty());
+}
+
+/// Clicks the Material tab's Save button, whatever its count says.
+fn save_material(h: &mut Harness<'_, App>) {
+    let save = h.query_all_by_role(Role::Button).find(|b| b.accesskit_node().label().is_some_and(|l| l.starts_with("Save ") && l.ends_with("maps")));
+    save.expect("a Save button").click_accesskit();
+    h.run_steps(2);
+    let start = Instant::now();
+    while h.state().tab.saving.is_some() {
+        assert!(start.elapsed().as_secs() < 60, "the save never finished");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+}
+
+#[test]
+fn a_file_open_in_another_tab_is_kept() {
+    use texalith::from_normal::files::{base_name, out_name};
+    let (mut h, rig) = rig((1280.0, 800.0));
+    let dir = std::env::temp_dir().join(format!("texalith-ui-{}-crosstab", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("rock_disp.png");
+    image::GrayImage::from_fn(64, 64, |x, _| image::Luma([(x * 4) as u8])).save(&p).unwrap();
+    h.state_mut().tab.accept(texalith::from_normal::open::open(&p).unwrap());
+    h.state_mut().tab.settings.as_mut().unwrap().ticks.ao = true;
+    h.run_steps(2);
+    let id = h.state().tab.jobs_sent;
+    deliver(&mut h, &rig, outputs(id, 0.5));
+    save_material(&mut h);
+    let ao = dir.join(out_name(&base_name(&p), texalith::marker::MapKind::Ao));
+    let first = std::fs::read(&ao).expect("the first save wrote the AO map");
+    // The RNM tab opens that AO map on a layer.
+    rnm_filled(&mut h);
+    let layer = &mut h.state_mut().rnm.layers[0];
+    layer.ao.as_mut().unwrap().source.path = ao.clone();
+    // A new result, so the bytes differ; the file on disk is Texalith's own and would be replaced without a question.
+    deliver(&mut h, &rig, outputs(id, 0.25));
+    save_material(&mut h);
+    assert!(std::fs::read(&ao).unwrap() == first, "open in the RNM tab, so kept");
+    h.get_by_label("Some files will be kept");
+}
+
+#[test]
+fn every_tab_is_told_the_files_open_in_the_other_two() {
+    let (mut h, _rig) = rig((1280.0, 800.0));
+    let dir = std::env::temp_dir().join(format!("texalith-ui-{}-elsewhere", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("rock_disp.png");
+    image::GrayImage::from_fn(64, 64, |x, _| image::Luma([(x * 4) as u8])).save(&p).unwrap();
+    h.state_mut().tab.accept(texalith::from_normal::open::open(&p).unwrap());
+    rnm_filled(&mut h);
+    let rnm_files = h.state().rnm.open_files();
+    assert!(!rnm_files.is_empty());
+    tab_button(&mut h, "Material");
+    assert_eq!(h.state().tab.elsewhere, rnm_files);
+    tab_button(&mut h, "RNM");
+    assert_eq!(h.state().rnm.elsewhere, vec![p.clone()]);
+    tab_button(&mut h, "Cubemap");
+    assert_eq!(h.state().cube.elsewhere, [vec![p], rnm_files].concat());
 }

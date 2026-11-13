@@ -21,6 +21,10 @@ $m = [regex]::Match((Get-Content Cargo.toml -Raw -Encoding utf8), '(?m)^version\
 if (-not $m.Success) { throw 'no version in Cargo.toml' }
 $version = $m.Groups[1].Value
 if ($Suffix) { $version = "$version-$Suffix" }
+# A tag build must carry the tag's version: otherwise tag v0.1.1 ships a zip named 0.1.0.
+if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+    throw "tag $($env:GITHUB_REF_NAME) does not match Cargo.toml version $version (expected tag v$version)"
+}
 
 if (-not $TargetDir) { $TargetDir = Join-Path $root 'target\x86_64-pc-windows-msvc\release' }
 if (-not $NoBuild) {
