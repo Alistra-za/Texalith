@@ -932,14 +932,7 @@ impl Tab {
         if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
             self.save(None, ui.ctx());
         }
-        if self.saving.is_some() {
-            save::saving_row(ui);
-        }
-        match &self.status {
-            Some(Ok(m)) => line(ui, m),
-            Some(Err(e)) => error_line(ui, e),
-            None => {}
-        }
+        save::status_row(ui, self.saving.is_some(), &self.status);
     }
 
     /// The files this tab has open, with one still being read.

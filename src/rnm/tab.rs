@@ -681,14 +681,7 @@ impl RnmTab {
         if save.on_hover_text(format!("Saves as {}", name.unwrap_or_default())).clicked() {
             self.save(ui.ctx());
         }
-        if self.saving.is_some() {
-            save::saving_row(ui);
-        }
-        match &self.status {
-            Some(Ok(m)) => line(ui, m),
-            Some(Err(e)) => error_line(ui, e),
-            None => {}
-        }
+        save::status_row(ui, self.saving.is_some(), &self.status);
     }
 
     /// Encodes and writes on a thread (`save::start`): at once when nothing on disk needs a choice, otherwise the

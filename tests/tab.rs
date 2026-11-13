@@ -958,3 +958,27 @@ fn a_question_is_not_closed_by_the_arrival_of_a_file_picked_before_it() {
     assert!(label_exists(&h, REVIEW), "the question is still there to answer");
     assert_eq!(h.state().status, Some(Err("a line from the save".into())));
 }
+
+#[test]
+fn the_save_button_stays_put_whatever_the_line_under_it_says() {
+    let (mut h, _rig, _dir) = ready("status-row");
+    let top = |h: &Harness<'_, Tab>| h.get_by_role_and_label(Role::Button, "Save 3 maps").rect().min.y;
+    let idle = top(&h);
+    let long = format!("Nothing to save: rock_n1.png in {} already matches", "a very long folder name ".repeat(12));
+    h.state_mut().status = Some(Ok(long.clone()));
+    h.run_steps(2);
+    assert_eq!(top(&h), idle, "a long line");
+    assert!(h.query_by_label(&long).is_some(), "the whole line is still there to read");
+    h.state_mut().status = Some(Err(long));
+    h.run_steps(2);
+    assert_eq!(top(&h), idle, "a long error");
+    let (_gate, wait) = channel::<()>();
+    let saving = texalith::save::start(&h.ctx, vec![], Box::new(|w, k| format!("{w} written, {k} kept")), move || {
+        let _ = wait.recv();
+        vec![]
+    });
+    h.state_mut().status = None;
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    assert_eq!(top(&h), idle, "while a save runs");
+}

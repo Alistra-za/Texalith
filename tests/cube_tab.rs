@@ -564,3 +564,26 @@ fn the_refusal_line_goes_when_a_fitting_type_is_picked() {
     settle(&mut h);
     assert_eq!(h.state().status, None);
 }
+
+#[test]
+fn the_save_button_stays_put_whatever_the_line_under_it_says() {
+    let d = temp("status-row");
+    let mut h = rig();
+    open(&mut h, &png(&d, "pano.png", 64, 32));
+    settle(&mut h);
+    let top = |h: &Harness<'_, CubeTab>| h.get_by_role_and_label(Role::Button, "Save").rect().min.y;
+    let idle = top(&h);
+    let long = format!("Nothing to save: rock_n1.png in {} already matches", "a very long folder name ".repeat(12));
+    h.state_mut().status = Some(Ok(long.clone()));
+    h.run_steps(2);
+    assert_eq!(top(&h), idle, "a long line");
+    assert!(h.query_by_label(&long).is_some(), "the whole line is still there to read");
+    h.state_mut().status = Some(Err(long));
+    h.run_steps(2);
+    assert_eq!(top(&h), idle, "a long error");
+    let (_gate, saving) = held_save(&h.ctx);
+    h.state_mut().status = None;
+    h.state_mut().saving = Some(saving);
+    h.run_steps(2);
+    assert_eq!(top(&h), idle, "while a save runs");
+}

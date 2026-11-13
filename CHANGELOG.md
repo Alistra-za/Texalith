@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1 (Unreleased)
+## 0.1.1
 
 ### Sliders and preview
 
@@ -15,6 +15,7 @@
 - PNGs are written about 10 times faster: a detailed 8192 normal map takes about 2 s, was about 19 s. Files come out 2 to 50 % larger. A mostly flat map can come out 3 times larger, but such a file is small (6 MB, was 2 MB).
 - A file open in any tab is kept, also when you save from another tab. The dialog says "This file is open in Texalith, so it is kept". On the **RNM** and **Cubemap** tabs the output takes the next free numbered name instead.
 - The check for files Texalith made reads a PNG's text chunk and no longer decodes its pixels.
+- The line under **Save** is always one row, so **Save** stays where it is. A line too long for the column is cut; hover it to read all of it.
 
 ### Material tab
 

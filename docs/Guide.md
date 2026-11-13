@@ -89,6 +89,7 @@ A source larger than 8192 px on a side is halved until it fits. A panorama, angu
 
 - Files are 16-bit PNGs. Each one records Texalith's version, the source's path and hash, and the settings, in a text chunk.
 - Save runs in the background. **Save** is off and "Saving…" shows until the files are written; an 8192 blend takes a few seconds. Close the window during a save and Texalith finishes the save before it exits.
+- The line under **Save** says what was written, or why nothing was. Hover a line that is cut off to read all of it.
 - A file Texalith made and nobody changed is replaced without asking.
 - Any other file with the same name opens **Some files will be kept**. Choose **Keep** or **Overwrite** per file; **Keep a backup in _sdc\texalith-backup** copies an overwritten file into that folder, beside the output, first.
 - A file open in any tab is always kept, also when you save from another tab.

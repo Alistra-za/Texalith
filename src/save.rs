@@ -271,10 +271,19 @@ pub fn wait() {
     }
 }
 
-/// The "Saving…" row a tab shows while its save runs.
-pub fn saving_row(ui: &mut egui::Ui) {
+/// The row under a tab's Save button: the running save, else the last status line. It is one row high whatever it
+/// says, so Save never moves; a line too long for the column is cut and shows in full on hover.
+pub fn status_row(ui: &mut egui::Ui, saving: bool, status: &Option<Result<String, String>>) {
     ui.horizontal(|ui| {
-        ui.spinner();
-        ui.label("Saving…");
+        ui.set_min_height(ui.spacing().interact_size.y);
+        match status {
+            _ if saving => {
+                ui.spinner();
+                ui.label("Saving…");
+            }
+            Some(Ok(m)) => drop(ui.add(egui::Label::new(m).truncate())),
+            Some(Err(e)) => drop(ui.add(egui::Label::new(egui::RichText::new(e).color(ui.visuals().error_fg_color)).truncate())),
+            None => {}
+        }
     });
 }
